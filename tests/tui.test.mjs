@@ -2,9 +2,13 @@
 // captured stdout (no TTY required). Verifies key decoding, screen flow, the
 // two-step delete confirmation, and that only the intended session is removed.
 import { createRequire } from 'node:module';
-import { AcpClient } from '/root/mcode-session-manager/src/acp.js';
-import { decodeKeys } from '/root/mcode-session-manager/src/tui.js';
-import { Logger } from '/root/mcode-session-manager/src/log.js';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { AcpClient } from '../src/acp.js';
+import { decodeKeys } from '../src/tui.js';
+import { Logger } from '../src/log.js';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const req = createRequire('/root/.minimax-code/releases/0.5.2/lib/node_modules/@minimax-ai/code/cli.js');
 const D = req('better-sqlite3');
@@ -28,7 +32,7 @@ ok('mixed chunk', JSON.stringify(dec('\x1b[Bj\x03')) === '["down","j","ctrlc"]')
 
 // ---------------------------------------------------------------- TUI drive
 console.log('\n=== TUI state machine ===');
-const { Tui } = await import('/root/mcode-session-manager/src/tui.js');
+const { Tui } = await import('../src/tui.js');
 const log = new Logger({ level: 'error' });
 const flags = { color: false, ascii: true, includeArchived: true, noBackup: true };
 

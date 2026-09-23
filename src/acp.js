@@ -6,6 +6,7 @@ import { MCODE_BIN } from './env.js';
 
 const PROTOCOL_VERSION = 1;
 const ACP_TIMEOUT_MS = 20000;
+const KILL_GRACE_MS = 2000;
 
 export class AcpClient {
   constructor({ log, bin = MCODE_BIN, spawnArgs = ['acp'] } = {}) {
@@ -26,6 +27,7 @@ export class AcpClient {
     this.child = child;
     child.stdout.on('data', d => this._onData(d));
     child.on('error', e => { this.log?.warn(`acp child error: ${e.message}`); this._failAll(e); });
+    child.stdin.on('error', e => { this.log?.warn(`acp stdin error: ${e.message}`); this._failAll(e); });
     child.on('exit', (code, sig) => {
       this.log?.verbose(`acp server exited code=${code} sig=${sig}`);
       this._failAll(new Error(`ACP server exited (code=${code})`));
@@ -60,13 +62,27 @@ export class AcpClient {
     this._start();
     const id = this._nextId++;
     const p = new Promise((resolve, reject) => this._pending.set(id, { resolve, reject }));
-    this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    try {
+      this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    } catch (e) {
+      this._pending.delete(id);
+      return Promise.reject(e);
+    }
     return p;
   }
 
   async _call(method, params, ms = ACP_TIMEOUT_MS) {
-    const t = new Promise((_, rej) => setTimeout(() => rej(new Error(`ACP timeout: ${method}`)), ms));
-    return Promise.race([this._send(method, params ?? {}), t]);
+    // Clear the timer on settle: an unref'd-but-live setTimeout would otherwise
+    // keep the process alive for up to `ms` after every ACP call returns.
+    let timer = null;
+    try {
+      return await Promise.race([
+        this._send(method, params ?? {}),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`ACP timeout: ${method}`)), ms); }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async initialize() {
@@ -74,7 +90,7 @@ export class AcpClient {
     const res = await this._call('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: {},
-      clientInfo: { name: 'mcode-session-manager', version: '1.0.0' },
+      clientInfo: { name: 'mcode-session-manager', version: '1.1.0' },
     });
     this.serverInfo = res?.agentInfo ?? {};
     this.initialized = true;
@@ -112,7 +128,13 @@ export class AcpClient {
     const c = this.child;
     this.child = null;
     this.initialized = false;
-    if (c) { try { c.kill(); } catch {} }
+    this._buf = Buffer.alloc(0);
+    this._failAll(new Error('ACP client closed'));
+    if (!c) return;
+    try { c.kill('SIGTERM'); } catch { /* already gone */ }
+    // escalate if the server ignores SIGTERM, without blocking close forever
+    const t = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* gone */ } }, KILL_GRACE_MS);
+    if (typeof t.unref === 'function') t.unref();
   }
 }
 

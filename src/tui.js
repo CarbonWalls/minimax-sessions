@@ -15,7 +15,8 @@ import { Lifecycle } from './lifecycle.js';
 import { Inspector } from './inspect.js';
 import { SqliteAdapter } from './sqlite.js';
 import { MCODE_BIN, dbExists, mcodeBinExists } from './env.js';
-import { Theme, dispWidth, padTo } from './theme.js';
+import { Theme, dispWidth, padTo, clipTo } from './theme.js';
+import { trunc as truncShared, shortWs, relAge, iso, fitLR } from './format.js';
 
 const GLYPHS_ASCII = { h: '-', v: '|', arrow: '>', ok: 'ok', warn: '!', up: '^', down: 'v', cursor: '_' };
 const GLYPHS_UNICODE = { h: '─', v: '│', arrow: '›', ok: '✓', warn: '⚠', up: '↑', down: '↓', cursor: '▏' };
@@ -94,6 +95,7 @@ export class Tui {
     this.searchBuf = '';
     this.searchRows = null;
     this._searchKey = null;
+    this._facets = { archived: 0, active: 0 };
   }
 
   async run() {
@@ -124,10 +126,12 @@ export class Tui {
     try { process.stdin.removeAllListeners('data'); process.stdin.pause(); } catch {}
     this._leaveAlt();
     if (this.pendingExec) {
-      const { args } = this.pendingExec;
-      process.stdout.write(`launching: mcode ${args.join(' ')}\n`);
+      const { args, cwd } = this.pendingExec;
+      process.stdout.write(`launching: mcode ${args.join(' ')}${cwd ? `  (cwd: ${cwd})` : ''}\n`);
       try {
-        const child = spawn(MCODE_BIN, args, { stdio: 'inherit' });
+        // mcode's top-level CLI has no --cwd flag; the workspace is set via
+        // the child process cwd (the session already stores workspace_dir).
+        const child = spawn(MCODE_BIN, args, { stdio: 'inherit', cwd: cwd || undefined });
         child.on('exit', c => this._done(c ?? 0));
         child.on('error', () => this._done(code));
         return;
@@ -143,9 +147,12 @@ export class Tui {
   destroy() { this._leaveAlt(); try { this.db.close(); } catch {} }
 
   get width() { return Math.max(20, process.stdout.columns || 80); }
-  get height() { return Math.max(8, process.stdout.rows || 24); }
-  // rows that fit between the browser header and footer
-  get pageSize() { return Math.max(3, this.height - 6); }
+  get height() { return Math.max(6, process.stdout.rows || 24); }
+  // rows available for list content after header/footer chrome
+  get pageSize() {
+    // browser chrome: header + rule + rule + pos + hint = 5
+    return Math.max(1, this.height - 5);
+  }
 
   onKey(chunk) {
     for (const k of decodeKeys(chunk)) {
@@ -361,6 +368,9 @@ export class Tui {
     this.total = total;
     if (rows.length === 0 && this.offset > 0) { this.offset = 0; }
     if (this.cursor >= rows.length) this.cursor = Math.max(0, rows.length - 1);
+    // facet counts are two COUNT(*) queries — refresh them with the data, not
+    // on every keystroke repaint
+    try { this._facets = this.discovery.facetCounts(); } catch { /* keep last */ }
     this.log?.verbose(`refresh offset=${this.offset} rows=${rows.length} total=${total} filters=${JSON.stringify(this.filters)}`);
   }
 
@@ -461,9 +471,9 @@ export class Tui {
   openResume(s) {
     if (!mcodeBinExists()) { this.message = `mcode binary not found (${MCODE_BIN})`; this.messageKind = 'warn'; return this.render(); }
     const args = ['--session', s.session_id];
-    if (s.workspace_dir) args.push('--cwd', s.workspace_dir);
-    this.pendingExec = { args };
-    this.message = `launching mcode ${args.join(' ')}`;
+    // mcode top-level has no --cwd; pass the workspace as the child's cwd
+    this.pendingExec = { args, cwd: s.workspace_dir || undefined };
+    this.message = `launching mcode ${args.join(' ')}${s.workspace_dir ? ` (cwd: ${s.workspace_dir})` : ''}`;
     this.render();
     this.quit(0);
   }
@@ -553,6 +563,10 @@ export class Tui {
     else if (this.screen === 'output') out = this.renderOutput(W, line);
     else out = [''];
 
+    // Hard guarantee: no line may exceed the terminal width. A single
+    // soft-wrap desynchronises absolute cursor addressing and is what leaves
+    // duplicate `›` cursors / stacked footers on screen.
+    out = out.map(l => clipTo(l, W));
     while (out.length < this.height) out.push('');
     out = out.slice(0, this.height);
 
@@ -589,173 +603,329 @@ export class Tui {
   renderBrowser(W, line) {
     const g = this.glyphs;
     const f = this.filters;
-    const fac = this.discovery.facetCounts();
+    const fac = this._facets;
     const T = this.theme;
     const { cur, total } = this.positionInfo();
     const moreUp = this.offset > 0;
     const moreDown = this.offset + this.rows.length < total;
-    const head = T.style({ bold: true, fg: 'brand' }, ' mcode sessions')
-      + '  ' + T.fg('muted', `n=${total}`) + '  ' + T.fg('warning', `archived=${fac.archived}`)
-      + '  ' + T.fg('signal', `locked=${fac.active}`)
-      + (moreUp || moreDown ? '  ' + T.fg('dim', `${moreUp ? g.up : ''}${moreDown ? g.down : ''}`) : '');
+    const head = clipTo(
+      T.style({ bold: true, fg: 'brand' }, ' mcode sessions')
+      + '  ' + T.fg('muted', `n=${total}`)
+      + '  ' + T.fg('warning', `arch=${fac.archived}`)
+      + '  ' + T.fg('signal', `lock=${fac.active}`)
+      + (moreUp || moreDown ? '  ' + T.fg('dim', `${moreUp ? g.up : ''}${moreDown ? g.down : ''}`) : ''),
+      W,
+    );
+    // chrome: head + top rule + content(pageSize) + rule + pos + hint
     const rows = [head, T.fg('border', line)];
+    const ps = this.pageSize;
     const start = this.offset + 1;
-    if (!this.rows.length) rows.push(T.fg('muted', '(no sessions match — / search, x clear filters)'));
-    for (let i = 0; i < this.rows.length; i++) rows.push(this.formatRow(this.rows[i], start + i, W, i === this.cursor));
+    const shown = this.rows.slice(0, ps);
+    if (!shown.length) rows.push(T.fg('muted', clipTo('(no match — / search, x clear)', W)));
+    for (let i = 0; i < shown.length; i++) rows.push(this.formatRow(shown[i], start + i, W, i === this.cursor));
+    while (rows.length < 2 + ps) rows.push('');
     rows.push(T.fg('border', line));
     const fdesc = [
-      f.archived === 'exclude' ? 'no-arch' : f.archived === 'only' ? 'arch-only' : 'arch-in',
-      f.q ? `q:"${f.q}"` : null, f.status ? `status=${f.status}` : null,
-      f.kind ? `kind=${f.kind}` : null, f.workspace ? `ws=${shortWs(f.workspace)}` : null,
-    ].filter(Boolean).join(' ');
+      f.archived === 'exclude' ? 'no-arch' : f.archived === 'only' ? 'arch' : '',
+      f.q ? `q:${f.q}` : null, f.status ? f.status : null,
+      f.kind ? f.kind : null, f.workspace ? shortWs(f.workspace) : null,
+    ].filter(Boolean).join('  ');
     const pos = T.style({ bold: true, fg: 'signal' }, `${cur}/${total}`);
-    rows.push(` ${pos}  ${T.fg('muted', fdesc)}`);
-    const hint = W < 46
-      ? 'j/k move  / search  enter open  n/b page  x clear  q quit'
-      : 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r refresh  q quit';
-    rows.push((this.message ? this.colored(this.message, this.messageKind) + '  ' : '') + T.fg('dim', hint));
+    const posLine = fdesc
+      ? ` ${pos}  ${T.fg('muted', fdesc)}`
+      : ` ${pos}`;
+    rows.push(clipTo(posLine, W));
+    rows.push(clipTo(this._hintLine(W), W));
     this.message = '';
+    // hard guarantee: never emit more than the terminal height (footer first)
+    if (rows.length > this.height) return rows.slice(rows.length - this.height);
     return rows;
+  }
+
+  // shared bottom hint; shrinks with width and prepends any one-shot message
+  _hintLine(W) {
+    const T = this.theme;
+    const W2 = W;
+    let hint;
+    if (W2 < 40) hint = 'j/k  enter  /  q';
+    else if (W2 < 56) hint = 'j/k move  enter  /  x clear  q';
+    else if (W2 < 72) hint = 'j/k move  enter  /  n/b page  x clear  q quit';
+    else if (W2 < 100) hint = 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  q quit';
+    else hint = 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r refresh  q quit';
+    const msg = this.message ? this.colored(this.message, this.messageKind) + '  ' : '';
+    return clipTo(msg + T.fg('dim', hint), W2);
   }
 
   formatRow(r, n, W, sel) {
     const g = this.glyphs;
     const T = this.theme;
     const status = r.status ?? '?';
-    const arch = r.archived ? ' [arch]' : '';
-    const kind = r.session_kind && r.session_kind !== 'conversation' ? ` <${r.session_kind[0]}>` : '';
+    const arch = r.archived ? ' arch' : '';
     const age = relAge(r.updated_at_ms);
+    const kind = r.session_kind && r.session_kind !== 'conversation' ? ` <${r.session_kind[0]}>` : '';
     const ws = (!r.workspace_dir || r.workspace_dir === '/root') ? '' : ` @${shortWs(r.workspace_dir)}`;
     const num = String(n).padStart(W < 46 ? 2 : 3);
+
     if (W < 46) {
-      const titleW = Math.max(6, W - 2 - dispWidth(status) - dispWidth(arch) - dispWidth(num));
-      const title = truncW(r.title ?? '(untitled)', titleW);
-      const plain = `${sel ? g.arrow : ' '}${num} ${title} ${status}${arch}`;
+      const right = `${status}${arch}`;
+      const leftBudget = Math.max(4, W - 1 - dispWidth(num) - 1 - dispWidth(right));
+      const title = truncW(r.title ?? '(untitled)', leftBudget);
+      const plain = clipTo(`${sel ? g.arrow : ' '}${num} ${title} ${right}`, W);
       if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
-      return [
+      return clipTo([
         T.fg('dim', num), ' ', T.fg('text', title), ' ',
         T.fg(statusRole(status), status), T.fg('warning', arch),
-      ].join('');
+      ].join(''), W);
     }
-    const titleW = Math.max(10, Math.min(38, W - 14 - dispWidth(kind) - dispWidth(ws) - dispWidth(status) - dispWidth(arch) - dispWidth(age)));
-    const title = truncW(r.title ?? '(untitled)', titleW);
-    const plain = `${sel ? g.arrow : ' '}${num}  ${title}${kind}${ws}  ${status}${arch}  ${age}`;
-    if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
-    return [
-      T.fg('dim', num), '  ',
-      T.fg('text', title), T.fg('muted', kind), T.fg('dim', ws), '  ',
-      T.fg(statusRole(status), status), T.fg('warning', arch), '  ',
-      T.fg('dim', age),
-    ].join('');
+
+    // right column: status (padded) + optional arch + age — always aligned
+    const rightPlain = `${status.padEnd(7)}${arch} ${age.padStart(4)}`;
+    const fixed = 1 + dispWidth(num) + 2 + dispWidth(kind) + dispWidth(ws) + 2 + dispWidth(rightPlain);
+    const title = truncW(r.title ?? '(untitled)', Math.max(3, Math.min(40, W - fixed)));
+    const leftPlain = `${sel ? g.arrow : ' '}${num}  ${title}${kind}${ws}`;
+    const plain = clipTo(fitLR(leftPlain, rightPlain, W), W);
+
+    if (sel) {
+      return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
+    }
+    // non-selected: colour left and right independently, fill the gap with spaces
+    const lw = dispWidth(leftPlain);
+    const rw = dispWidth(rightPlain);
+    const gap = Math.max(1, W - lw - rw);
+    return clipTo(
+      T.fg('dim', `${sel ? g.arrow : ' '}${num}`) + '  '
+      + T.fg('text', title) + T.fg('muted', kind) + T.fg('dim', ws)
+      + ' '.repeat(gap)
+      + T.fg(statusRole(status), status.padEnd(7))
+      + T.fg('warning', arch) + ' '
+      + T.fg('dim', age.padStart(4)),
+      W,
+    );
   }
 
   renderSearch(W, line) {
     const T = this.theme;
     const g = this.glyphs;
     const { rows, total, q } = this.searchResults;
-    const prompt = T.style({ bold: true, fg: 'brand' }, ' search title: ')
-      + T.style({ fg: 'text', bg: 'selectedBg' }, padTo(this.searchBuf, Math.max(6, W - 14)) + g.cursor);
+    const promptW = Math.max(6, W - 16);
+    const prompt = clipTo(T.style({ bold: true, fg: 'brand' }, ' search title: ')
+      + T.style({ fg: 'text', bg: 'selectedBg' }, padTo(clipTo(this.searchBuf, promptW), promptW) + g.cursor), W);
+    // chrome: prompt + rule + body + rule + footer = 5
+    const H = this.height;
+    const body = Math.max(0, H - 5);
     const out = [prompt, T.fg('border', line)];
-    if (!rows.length) out.push(T.fg('muted', `(no sessions match "${q}")`));
-    for (let i = 0; i < rows.length; i++) out.push(this.formatRow(rows[i], i + 1, W, false));
+    if (!rows.length && body > 0) out.push(T.fg('muted', clipTo(`(no sessions match "${q}")`, W)));
+    for (let i = 0; i < Math.min(rows.length, body); i++) out.push(this.formatRow(rows[i], i + 1, W, false));
+    while (out.length < Math.max(2, H - 2)) out.push('');
+    out.length = Math.max(2, H - 2);
     out.push(T.fg('border', line));
-    out.push(` ${T.style({ bold: true, fg: 'signal' }, `${total}`)} ${T.fg('muted', 'match(es)')}`
-      + T.fg('dim', '   enter apply   esc cancel'));
-    return out;
+    out.push(clipTo(
+      ` ${T.style({ bold: true, fg: 'signal' }, String(total))} ${T.fg('muted', 'match(es)')}`
+      + T.fg('dim', W < 60 ? '   enter ok  esc' : '   enter apply   esc cancel'),
+      W,
+    ));
+    return out.slice(0, H);
   }
 
   renderMenu(W, line) {
     const s = this.selected;
     const T = this.theme;
     const x = s ? this.discovery.getSession(s.session_id) : null;
-    if (!x) return [T.fg('muted', '(session gone — press q)')];
-    const rows = [
-      ' ' + T.style({ bold: true, fg: 'brand' }, `session: ${trunc(x.title ?? '(untitled)', Math.max(10, W - 12))}`),
-      ` ${T.fg('muted', 'id:')} ${T.fg('dim', x.session_id)}`,
-      ` ${T.fg('muted', 'status:')} ${T.fg(statusRole(x.status), x.status)}${x.archived ? T.fg('warning', ' (archived)') : ''}`
-      + `   ${T.fg('muted', 'kind:')} ${x.session_kind}   ${T.fg('muted', 'ws:')} ${T.fg('dim', shortWs(x.workspace_dir ?? ''))}`,
-      T.fg('border', line),
-    ];
-    for (let i = 0; i < ACTION_MENU.length; i++) {
+    if (!x) return [T.fg('muted', clipTo('(session gone — press q)', W))];
+    const H = this.height;
+    const hasMsg = !!this.message;
+    // bottom chrome is fixed: rule + hint (+ optional message)
+    const bottom = 2 + (hasMsg ? 1 : 0);
+    // prefer full header (title/id/meta/rule) but shrink it on short terminals
+    // so the action list + footer always stay visible
+    let top = 4;
+    if (H - top - bottom < 3) top = Math.max(1, H - bottom - 3);
+    if (H - top - bottom < 1) top = Math.max(0, H - bottom);
+    const avail = Math.max(1, H - top - bottom);
+
+    const title = trunc(x.title ?? '(untitled)', Math.max(4, W - 2));
+    const head = [];
+    if (top >= 4) {
+      head.push(
+        clipTo(' ' + T.style({ bold: true, fg: 'brand' }, title), W),
+        clipTo(` ${T.fg('muted', 'id')} ${T.fg('dim', x.session_id)}`, W),
+        clipTo(
+          ` ${T.fg(statusRole(x.status), x.status)}${x.archived ? T.fg('warning', ' arch') : ''}`
+          + `  ${T.fg('muted', x.session_kind)}  ${T.fg('dim', shortWs(x.workspace_dir ?? ''))}`,
+          W,
+        ),
+        T.fg('border', line),
+      );
+    } else if (top >= 3) {
+      head.push(
+        clipTo(' ' + T.style({ bold: true, fg: 'brand' }, title), W),
+        clipTo(` ${T.fg('muted', 'id')} ${T.fg('dim', x.session_id)}`, W),
+        T.fg('border', line),
+      );
+    } else if (top >= 2) {
+      head.push(
+        clipTo(' ' + T.style({ bold: true, fg: 'brand' }, title), W),
+        T.fg('border', line),
+      );
+    } else if (top >= 1) {
+      head.push(T.fg('border', line));
+    }
+    while (head.length < top) head.push('');
+    head.length = top;
+
+    // window the action list around the highlight so the footer never falls off
+    const n = ACTION_MENU.length;
+    let start = 0;
+    let end = Math.min(n, avail);
+    if (n > avail) {
+      const room = Math.max(1, avail - 2);
+      start = Math.max(0, Math.min(n - room, this._menuIdx - (room >> 1)));
+      end = Math.min(n, start + room);
+    }
+    const menuRows = [];
+    if (start > 0) menuRows.push(T.fg('dim', clipTo(`  ↑ +${start}`, W)));
+    for (let i = start; i < end; i++) {
       const [key, label] = ACTION_MENU[i];
       const hl = i === this._menuIdx;
       const dangerous = key === '6';
       const plain = `${hl ? this.glyphs.arrow : ' '}${key}  ${label}`;
-      if (hl) rows.push(T.style({ bg: 'selectedBg', fg: dangerous ? 'error' : 'signal', bold: true }, padTo(plain, W)));
-      else rows.push(` ${T.fg('dim', key)}  ${dangerous ? T.fg('error', label) : T.fg('text', label)}`);
+      if (hl) menuRows.push(T.style({ bg: 'selectedBg', fg: dangerous ? 'error' : 'signal', bold: true }, padTo(clipTo(plain, W), W)));
+      else menuRows.push(clipTo(` ${T.fg('dim', key)}  ${dangerous ? T.fg('error', label) : T.fg('text', label)}`, W));
     }
-    rows.push(T.fg('border', line));
-    rows.push(T.fg('dim', ' esc/q/backspace back   type the number or press enter'));
-    if (this.message) rows.push(this.colored(this.message, this.messageKind));
+    if (end < n) menuRows.push(T.fg('dim', clipTo(`  ↓ +${n - end}`, W)));
+    while (menuRows.length < avail) menuRows.push('');
+    menuRows.length = avail;
+
+    const rows = [...head, ...menuRows, T.fg('border', line)];
+    rows.push(clipTo(T.fg('dim', W < 44 ? ' esc  type number' : ' esc/q back   type the number or press enter'), W));
+    if (hasMsg) rows.push(clipTo(this.colored(this.message, this.messageKind), W));
     this.message = '';
+    if (rows.length > H) return rows.slice(rows.length - H); // keep footer
     return rows;
   }
 
   renderConfirm(W, line) {
     const T = this.theme;
     const s = this.deleteTarget, p = this.deletePlan;
-    const showRows = Math.max(4, this.height - 16);
+    const H = this.height;
+    // bottom is ALWAYS kept: rule + token + input + hint (the safety UI)
+    const bottom = 4;
+    // full top is 6 lines; shrink from the least-critical end on short screens
+    const maxTop = 6;
+    let top = maxTop;
+    if (H - top - bottom < 1) top = Math.max(2, H - bottom - 1);
+    if (H - top - bottom < 0) top = Math.max(1, H - bottom);
+    const showRows = Math.max(0, H - top - bottom);
+
+    const head = [];
+    const title = T.style({ bold: true, fg: 'error' }, ' DELETE — destructive');
+    const sessionLine = ` ${T.fg('muted', 'session')} ${T.fg('text', trunc(s.title ?? s.session_id, Math.max(4, W - 12)))}`;
+    const idLine = ` ${T.fg('muted', 'id')} ${T.fg('dim', s.session_id)}`;
+    const backupLine = ` ${T.fg('muted', 'backup')} ${this.flags.noBackup ? T.fg('error', 'DISABLED (--no-backup)') : T.fg('success', 'automatic')}`;
+    const border = T.fg('border', line);
+    const summary = ` ${T.fg('muted', 'tables')} ${T.fg('text', String(p.affecting.length))}   ${T.fg('muted', 'rows')} ${T.fg('text', String(p.rows))}`;
+    // rebuild in visual order with progressive dropping
+    if (top >= 6) head.push(title, sessionLine, idLine, backupLine, border, summary);
+    else if (top >= 5) head.push(title, idLine, backupLine, border, summary);
+    else if (top >= 4) head.push(title, idLine, border, summary);
+    else if (top >= 3) head.push(title, idLine, border);
+    else if (top >= 2) head.push(title, border);
+    else if (top >= 1) head.push(title);
+    while (head.length < top) head.push('');
+    head.length = top;
+    for (let i = 0; i < head.length; i++) head[i] = clipTo(head[i], W);
+
+    const body = [];
+    for (const e of p.affecting.slice(0, showRows)) {
+      body.push(clipTo(`   ${T.fg('warning', String(e.count).padStart(6))}  ${T.fg('dim', e.table)}`, W));
+    }
+    if (showRows > 0 && p.affecting.length > showRows) {
+      body.push(clipTo(`   ${T.fg('muted', `… +${p.affecting.length - showRows} more`)}`, W));
+    }
+    const room = Math.max(0, showRows - body.length);
+    for (const w of p.warnings.slice(0, room)) {
+      body.push(clipTo(`   ${T.fg('warning', 'warn: ' + w)}`, W));
+    }
+    while (body.length < showRows) body.push('');
+    body.length = showRows;
+
     const rows = [
-      T.style({ bold: true, fg: 'error' }, ' DELETE — destructive'),
-      ` ${T.fg('muted', 'session:')} ${T.fg('text', trunc(s.title ?? s.session_id, Math.max(10, W - 12)))}`,
-      ` ${T.fg('muted', 'id:')} ${T.fg('dim', s.session_id)}`,
-      ` ${T.fg('muted', 'backup:')} ${this.flags.noBackup ? T.fg('error', 'DISABLED (--no-backup)') : T.fg('success', 'automatic (path shown after)')}`,
+      ...head,
+      ...body,
       T.fg('border', line),
-      ` ${T.fg('muted', 'tables affected:')} ${T.fg('text', String(p.affecting.length))}   ${T.fg('muted', 'rows:')} ${T.fg('text', String(p.rows))}`,
+      clipTo(T.style({ bold: true, fg: 'error' }, ` type last 8 of id  [${this.confirmToken}]`), W),
+      clipTo(` > ${this.inputBuf}${this.glyphs.cursor}`, W),
+      clipTo(T.fg('dim', W < 36 ? ' esc cancels' : ' esc/q cancels without any change'), W),
     ];
-    for (const e of p.affecting.slice(0, showRows)) rows.push(`   ${T.fg('warning', String(e.count).padStart(6))}  ${T.fg('dim', e.table)}`);
-    if (p.affecting.length > showRows) rows.push(`   ${T.fg('muted', `... +${p.affecting.length - showRows} more table(s)`)}`);
-    for (const w of p.warnings) rows.push(`   ${T.fg('warning', 'warn: ' + w)}`);
-    rows.push(T.fg('border', line));
-    rows.push(T.style({ bold: true, fg: 'error' }, ` type the last 8 chars of the id to confirm: [${this.confirmToken}]`));
-    rows.push(` > ${this.inputBuf}${this.glyphs.cursor}`);
-    rows.push(T.fg('dim', ' esc/q cancels without any change'));
+    // the safety footer (token + input) must survive even on a tiny screen
+    if (rows.length > H) return rows.slice(rows.length - H);
     return rows;
   }
 
   renderInput(W, line) {
     const T = this.theme;
     return [
-      ' ' + T.style({ bold: true, fg: 'brand' }, this.inputPrompt),
+      clipTo(' ' + T.style({ bold: true, fg: 'brand' }, this.inputPrompt), W),
       T.fg('border', line),
-      ` > ${T.style({ bg: 'selectedBg' }, this.inputBuf + this.glyphs.cursor)}`,
+      clipTo(` > ${T.style({ bg: 'selectedBg' }, padTo(this.inputBuf + this.glyphs.cursor, Math.max(4, W - 3)))}`, W),
       T.fg('border', line),
-      T.fg('dim', ' enter confirms   esc cancels'),
-    ];
+      clipTo(T.fg('dim', W < 36 ? ' enter  esc' : ' enter confirms   esc cancels'), W),
+    ].slice(0, this.height);
   }
 
   renderFilter(W, line) {
     const T = this.theme;
-    const rows = [' ' + T.style({ bold: true, fg: 'brand' }, `filter: ${this.filterKind}`), T.fg('border', line)];
-    const max = Math.min(this.foptions.length, this.height - 6);
-    for (let i = 0; i < max; i++) {
+    const H = this.height;
+    const top = 2;
+    const bottom = 2;
+    const max = Math.max(1, H - top - bottom);
+    const rows = [clipTo(' ' + T.style({ bold: true, fg: 'brand' }, `filter: ${this.filterKind}`), W), T.fg('border', line)];
+    // window options around the cursor so the footer stays visible
+    const n = this.foptions.length;
+    let start = 0;
+    if (n > max) start = Math.max(0, Math.min(n - max, this.fcursor - (max >> 1)));
+    const end = Math.min(n, start + max);
+    const body = [];
+    if (start > 0) body.push(T.fg('dim', clipTo(`  ↑ +${start}`, W)));
+    for (let i = start; i < end; i++) {
       const o = this.foptions[i];
       const hl = this.fcursor === i;
-      const label = trunc(o.label, Math.max(8, W - 8));
+      const label = clipTo(trunc(o.label, Math.max(4, W - 8)), Math.max(4, W - 6));
       const plain = `${hl ? this.glyphs.arrow : ' '}${i + 1}  ${label}`;
-      if (hl) rows.push(T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W)));
-      else rows.push(` ${T.fg('dim', String(i + 1))}  ${T.fg('text', label)}`);
+      if (hl) body.push(T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W)));
+      else body.push(clipTo(` ${T.fg('dim', String(i + 1))}  ${T.fg('text', label)}`, W));
     }
-    rows.push(T.fg('border', line));
-    rows.push(T.fg('dim', ' j/k or number   enter selects   esc/x clears'));
+    if (end < n) body.push(T.fg('dim', clipTo(`  ↓ +${n - end}`, W)));
+    while (body.length < max) body.push('');
+    body.length = max;
+    rows.push(...body, T.fg('border', line));
+    rows.push(clipTo(T.fg('dim', W < 44 ? ' j/k  enter  esc' : ' j/k or number   enter selects   esc/x clears'), W));
+    if (rows.length > H) return rows.slice(rows.length - H);
     return rows;
   }
 
   renderOutput(W, line) {
     const T = this.theme;
     const L = this.outputText.split('\n');
-    const max = Math.max(3, this.height - 5);
+    // top: title, rule = 2; bottom: rule, hint = 2
+    const max = Math.max(1, this.height - 4);
     const start = Math.min(Math.max(0, this._outputScroll), Math.max(0, L.length - max));
     const shown = L.slice(start, start + max);
-    const more = L.length - max;
+    const moreAfter = L.length - start - shown.length;
+    const moreBefore = start;
+    const scrollNote = (moreBefore || moreAfter)
+      ? T.fg('dim', `  ${moreBefore ? '↑' : ''}${moreBefore && moreAfter ? ' ' : ''}${moreAfter ? `+${moreAfter}` : ''} j/k`)
+      : '';
     return [
-      ' ' + T.style({ bold: true, fg: 'brand' }, this.outputTitle)
-        + (more > 0 ? T.fg('dim', `  (${more} more line${more === 1 ? '' : 's'}, j/k scroll)`) : ''),
+      clipTo(' ' + T.style({ bold: true, fg: 'brand' }, this.outputTitle) + scrollNote, W),
       T.fg('border', line),
-      ...shown.map(l => trunc(l, W)),
+      ...shown.map(l => clipTo(l, W)),
+      ...Array.from({ length: Math.max(0, max - shown.length) }, () => ''),
       T.fg('border', line),
-      T.fg('dim', ' j/k scroll   any other key goes back'),
+      clipTo(T.fg('dim', W < 40 ? ' j/k scroll  esc' : ' j/k scroll   any other key goes back'), W),
     ];
+    if (rows.length > this.height) return rows.slice(rows.length - this.height);
+    return rows;
   }
 
   // -------------------------------------------------------------- utils
@@ -767,7 +937,6 @@ export class Tui {
 }
 
 // ----------------------------------------------------------------- utils
-export function trunc(s, n) { s = String(s ?? ''); return s.length > n ? s.slice(0, Math.max(0, n - 1)) + '…' : s; }
 // truncate to a *display width* (titles may contain wide characters)
 function truncW(s, n) {
   s = String(s ?? '');
@@ -779,18 +948,8 @@ function truncW(s, n) {
   }
   return out + '…';
 }
-function shortWs(w) { if (!w) return ''; const p = String(w).split('/'); return p[p.length - 1] || w; }
-function relAge(ms) {
-  if (ms == null) return '';
-  const s = Math.max(0, Math.round((Date.now() - Number(ms)) / 1000));
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.round(s / 60)}m`;
-  if (s < 86400) return `${Math.round(s / 3600)}h`;
-  if (s < 86400 * 30) return `${Math.round(s / 86400)}d`;
-  if (s < 86400 * 365) return `${Math.round(s / 86400 / 30)}mo`;
-  return `${Math.round(s / 86400 / 365)}y`;
-}
-function iso(ms) { if (ms == null) return '?'; try { return new Date(Number(ms)).toISOString(); } catch { return '?'; } }
+const trunc = truncShared; // same helper as the CLI (shared with format.js)
+export { trunc };
 
 // minimal key decoder: input chunk -> [{name, char}]
 // name is one of: up down left right home end pgup pgdn enter escape

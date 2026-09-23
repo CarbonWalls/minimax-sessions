@@ -3,8 +3,11 @@
 // Existence can optionally be cross-checked against the native ACP list.
 import { SqliteAdapter, isSessionKeyCol } from './sqlite.js';
 import { withAcp } from './acp.js';
+import { escapeLike } from './format.js';
 
-const SESSION_COLS = [
+// Preferred columns; only ones that actually exist in the live schema are
+// selected, so a future mcode schema change degrades instead of throwing.
+const PREFERRED_COLS = [
   'session_id', 'title', 'status', 'archived', 'session_kind', 'runtime',
   'agent_name', 'workspace_dir', 'project_workspace_dir', 'parent_session_id',
   'created_at_ms', 'updated_at_ms', 'visibility', 'purpose', 'session_type',
@@ -15,6 +18,17 @@ export class Discovery {
   constructor({ log, db } = {}) {
     this.log = log;
     this.db = db ?? new SqliteAdapter({ log });
+    this._cols = null;
+  }
+
+  _sessionCols() {
+    if (this._cols) return this._cols;
+    let have;
+    try { have = new Set(this.db.columns('local_runtime_sessions')); }
+    catch { have = new Set(PREFERRED_COLS); }
+    this._cols = PREFERRED_COLS.filter(c => have.has(c));
+    if (!this._cols.includes('session_id')) this._cols.unshift('session_id');
+    return this._cols;
   }
 
   // total count is cheap: one indexed count
@@ -25,7 +39,7 @@ export class Discovery {
     const r = this.db.read();
     return {
       archived: r.prepare("SELECT count(*) n FROM local_runtime_sessions WHERE archived=1").get().n,
-      active: r.prepare("SELECT count(*) n FROM local_runtime_session_locks").get().n,
+      active: r.prepare('SELECT count(*) n FROM local_runtime_session_locks').get().n,
     };
   }
 
@@ -34,8 +48,18 @@ export class Discovery {
     const params = [];
     const f = filters;
     if (f.q) {
-      where.push('(LOWER(title) LIKE ? OR session_id = ?)');
-      params.push('%' + String(f.q).toLowerCase() + '%', f.q);
+      // literal match on title/purpose + exact id; LIKE wildcards in the query
+      // are escaped so "100%" does not mean "100" + anything.
+      const like = '%' + escapeLike(String(f.q).toLowerCase()) + '%';
+      const parts = [`LOWER(title) LIKE ? ESCAPE '\\'`];
+      params.push(like);
+      if (this._sessionCols().includes('purpose')) {
+        parts.push(`LOWER(purpose) LIKE ? ESCAPE '\\'`);
+        params.push(like);
+      }
+      parts.push('session_id = ?');
+      params.push(f.q);
+      where.push('(' + parts.join(' OR ') + ')');
     }
     if (f.archived === 'only') { where.push('archived = 1'); }
     else if (f.archived === 'exclude') { where.push('archived = 0'); }
@@ -44,7 +68,8 @@ export class Discovery {
     if (f.workspace) { where.push('workspace_dir = ?'); params.push(f.workspace); }
     if (f.parent) { where.push('parent_session_id = ?'); params.push(f.parent); }
 
-    const sql = `SELECT ${SESSION_COLS.join(', ')}
+    const cols = this._sessionCols().join(', ');
+    const sql = `SELECT ${cols}
                  FROM local_runtime_sessions
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY updated_at_ms DESC, session_id ASC
@@ -56,6 +81,15 @@ export class Discovery {
     return { rows, total };
   }
 
+  // optional full-text pass over message bodies (slower; opt-in via --messages)
+  searchMessages(q, { limit = 200 } = {}) {
+    const like = '%' + escapeLike(String(q ?? '')) + '%';
+    return this.db.read().prepare(
+      `SELECT DISTINCT session_id FROM local_runtime_message_rows
+       WHERE data_json LIKE ? ESCAPE '\\' LIMIT ?`
+    ).all(like, limit).map(r => r.session_id);
+  }
+
   workspaces() {
     return this.db.read().prepare(
       `SELECT workspace_dir, count(*) n FROM local_runtime_sessions
@@ -63,14 +97,14 @@ export class Discovery {
     ).all();
   }
   statuses() {
-    return this.db.read().prepare(`SELECT status, count(*) n FROM local_runtime_sessions GROUP BY status ORDER BY n DESC`).all();
+    return this.db.read().prepare('SELECT status, count(*) n FROM local_runtime_sessions GROUP BY status ORDER BY n DESC').all();
   }
   kinds() {
-    return this.db.read().prepare(`SELECT session_kind, count(*) n FROM local_runtime_sessions GROUP BY session_kind ORDER BY n DESC`).all();
+    return this.db.read().prepare('SELECT session_kind, count(*) n FROM local_runtime_sessions GROUP BY session_kind ORDER BY n DESC').all();
   }
 
   getSession(id) {
-    return this.db.read().prepare(`SELECT ${SESSION_COLS.join(', ')} FROM local_runtime_sessions WHERE session_id = ?`).get(id) ?? null;
+    return this.db.read().prepare(`SELECT ${this._sessionCols().join(', ')} FROM local_runtime_sessions WHERE session_id = ?`).get(id) ?? null;
   }
   exists(id) {
     return this.db.read().prepare('SELECT 1 FROM local_runtime_sessions WHERE session_id = ?').get(id) !== undefined;
@@ -85,7 +119,7 @@ export class Discovery {
   }
   messageCountByRole(id) {
     return this.db.read().prepare(
-      `SELECT role, count(*) n FROM local_runtime_message_rows WHERE session_id = ? GROUP BY role`
+      'SELECT role, count(*) n FROM local_runtime_message_rows WHERE session_id = ? GROUP BY role'
     ).all(id);
   }
   // last activity across the session's own row and its message rows
@@ -117,8 +151,8 @@ export class Discovery {
     for (const t of this.db.tablesWithSessionKey()) {
       const keys = this.db.columns(t).filter(isSessionKeyCol);
       if (!keys.length) continue;
-      const where = keys.map(k => `"${k}" = ?`).join(' OR ');
-      const n = this.db.read().prepare(`SELECT count(*) n FROM "${t}" WHERE ${where}`).get(...keys.map(() => id)).n;
+      const where = keys.map(k => `"${String(k).replace(/"/g, '""')}" = ?`).join(' OR ');
+      const n = this.db.read().prepare(`SELECT count(*) n FROM "${String(t).replace(/"/g, '""')}" WHERE ${where}`).get(...keys.map(() => id)).n;
       per[t] = n; total += n;
     }
     return { total, per };

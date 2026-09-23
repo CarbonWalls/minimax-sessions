@@ -196,3 +196,35 @@ export function padTo(s, w, fill = ' ') {
   const pad = Math.max(0, w - dispWidth(s));
   return String(s) + fill.repeat(pad);
 }
+
+// Truncate to a maximum *display* width while preserving ANSI SGR sequences.
+// A TUI that paints with absolute cursor addressing must never emit a line
+// wider than the terminal: one soft-wrap shifts every later row and leaves
+// stale glyphs (double cursors, stacked footers) that diff-repaints never fix.
+export function clipTo(s, maxW) {
+  if (!(maxW > 0)) return '';
+  const str = String(s ?? '');
+  if (dispWidth(str) <= maxW) return str;
+  let w = 0;
+  let out = '';
+  let i = 0;
+  let clipped = false;
+  while (i < str.length) {
+    if (str[i] === '\x1b') {
+      const m = /^\x1b\[[0-9;?]*[A-Za-z]/.exec(str.slice(i));
+      if (m) { out += m[0]; i += m[0].length; continue; }
+      i += 1; // stray ESC — drop
+      continue;
+    }
+    const cp = str.codePointAt(i);
+    const ch = String.fromCodePoint(cp);
+    const cw = dispWidth(ch);
+    if (w + cw > maxW) { clipped = true; break; }
+    out += ch;
+    w += cw;
+    i += ch.length;
+  }
+  // if we cut mid-style, close the SGR so colour cannot bleed into the next cell
+  if (clipped && str.includes('\x1b')) out += '\x1b[0m';
+  return out;
+}

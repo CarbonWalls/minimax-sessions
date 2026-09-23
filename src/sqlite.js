@@ -22,7 +22,9 @@ export class SqliteAdapter {
     if (!this._ro) {
       const D = betterSqlite();
       this._ro = new D(DB_PATH, { readonly: true, fileMustExist: true });
-      this._ro.pragma('journal_mode = WAL');
+      // no journal_mode write here: the connection is read-only; the DB is
+      // already in WAL (mcode opens it that way) and a PRAGMA that mutates
+      // would fail on a truly immutable file.
       this._ro.pragma('foreign_keys = OFF');
       this._ro.pragma('busy_timeout = 5000');
     }
@@ -42,9 +44,9 @@ export class SqliteAdapter {
   }
 
   closeWrite() {
-    if (this._rw) { try { this._rw.close(); } catch {} this._rw = null; }
+    if (this._rw) { try { this._rw.close(); } catch { /* already closed */ } this._rw = null; }
   }
-  close() { this.closeWrite(); if (this._ro) { try { this._ro.close(); } catch {} this._ro = null; } }
+  close() { this.closeWrite(); if (this._ro) { try { this._ro.close(); } catch { /* already closed */ } this._ro = null; } }
 
   // ---------- schema introspection (never hardcode) ----------
   tables() {

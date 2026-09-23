@@ -4,9 +4,13 @@
 // disposable). The real user sessions are never mutated except read-only.
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
-import { AcpClient } from '/root/mcode-session-manager/src/acp.js';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-const MSM = '/root/mcode-session-manager/bin/mcode-sessions';
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const { AcpClient } = await import(join(ROOT, 'src', 'acp.js'));
+
+const MSM = join(ROOT, 'bin', 'mcode-sessions');
 const req = createRequire('/root/.minimax-code/releases/0.5.2/lib/node_modules/@minimax-ai/code/cli.js');
 const D = req('better-sqlite3');
 const DBP = '/root/.minimax/v2/sqlite/runtime-state.sqlite';

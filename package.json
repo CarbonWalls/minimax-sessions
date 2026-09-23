@@ -1,16 +1,33 @@
 {
   "name": "mcode-session-manager",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Standalone local session manager for MiniMax Code (inspect, browse, rename, archive, fork, delete, export, stats).",
   "type": "module",
   "bin": {
     "mcode-sessions": "./bin/mcode-sessions"
   },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "RESEARCH.md"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "start": "node ./bin/mcode-sessions"
+    "start": "node ./bin/mcode-sessions",
+    "test": "npm run test:unit && npm run test:tui && npm run test:mutations",
+    "test:unit": "node tests/unit.test.mjs",
+    "test:tui": "node tests/tui.test.mjs",
+    "test:mutations": "node tests/mutations.test.mjs",
+    "doctor": "node ./bin/mcode-sessions doctor"
   },
+  "keywords": [
+    "minimax",
+    "mcode",
+    "session",
+    "tui"
+  ],
   "license": "MIT"
 }

@@ -9,9 +9,9 @@ import { Safety } from './safety.js';
 import { Discovery } from './discovery.js';
 import { SqliteAdapter, quoteIdent } from './sqlite.js';
 import { withAcp } from './acp.js';
-import { DB_PATH } from './env.js';
 
 const NOW = () => Date.now();
+const CASCADE_PROBE_CHUNK = 400; // ids per verification query
 
 export class Lifecycle {
   constructor({ log, db, acpAvailable } = {}) {
@@ -147,10 +147,24 @@ export class Lifecycle {
       catch (e) { throw new Error(`backup failed, aborting delete (nothing removed): ${e.message}`); }
     }
 
+    // Materialise cascade victims BEFORE the parent rows disappear: after the
+    // primary row is gone the cascade subquery would match nothing, making a
+    // post-hoc recount useless as a leftover check.
+    let db = this.db.write();
+    const cascadeProbes = [];
+    for (const e of entries) {
+      if (e.kind !== 'cascade' || !e.count || !e.idCol) continue;
+      try {
+        const rows = db.prepare(
+          `SELECT ${quoteIdent(e.idCol)} v FROM ${quoteIdent(e.table)} WHERE ${e.where}`
+        ).all(...e.params);
+        if (rows.length) cascadeProbes.push({ table: e.table, idCol: e.idCol, ids: rows.map(r => r.v) });
+      } catch (err) { this.log?.debug(`cascade probe failed on ${e.table}: ${err.message}`); }
+    }
+
     // 8) perform transactionally
     let outcome = 'unknown';
     const removed = [];
-    const db = this.db.write();
     try {
       const tx = db.transaction(() => {
         for (const e of entries) {
@@ -168,19 +182,32 @@ export class Lifecycle {
       return { ...report, failed: true, outcome, error: this._describeError(e), backupPath };
     } finally {
       this.db.closeWrite();
+      db = null;
     }
 
-    // 9) verification
-    const stillThere = this.discovery.exists(id);
-    const verify = [];
-    for (const t of ['local_runtime_message_rows', 'local_runtime_token_usage', 'local_runtime_session_fts_keys']) {
-      try { verify.push({ table: t, remaining: this.db.read().prepare(`SELECT count(*) n FROM "${t}" WHERE session_id = ?`).get(id).n }); }
-      catch { /* table may not exist */ }
+    // 9) verification — every planned table is re-counted; cascade children are
+    //    checked by the concrete ids captured above, not by a dead subquery.
+    const dependentCheck = [];
+    for (const e of entries) {
+      if (!e.count) continue;
+      if (e.kind === 'cascade') continue; // handled via probes below
+      const remaining = this.db.rowCount(e.table, e.where, e.params);
+      dependentCheck.push({ table: e.table, remaining: remaining ?? 0 });
     }
+    for (const probe of cascadeProbes) {
+      let remaining = 0;
+      for (let i = 0; i < probe.ids.length; i += CASCADE_PROBE_CHUNK) {
+        const chunk = probe.ids.slice(i, i + CASCADE_PROBE_CHUNK);
+        const ph = chunk.map(() => '?').join(',');
+        remaining += this.db.rowCount(probe.table, `${quoteIdent(probe.idCol)} IN (${ph})`, chunk) ?? 0;
+      }
+      dependentCheck.push({ table: probe.table, remaining });
+    }
+    const stillThere = this.discovery.exists(id);
     return {
       ...report, committed: true, outcome, backupPath, removed,
-      verified: !stillThere && verify.every(v => v.remaining === 0),
-      sessionGone: !stillThere, dependentCheck: verify,
+      verified: !stillThere && dependentCheck.every(v => !v.remaining),
+      sessionGone: !stillThere, dependentCheck,
     };
   }
 

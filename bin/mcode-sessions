@@ -1,5 +1,2 @@
 #!/usr/bin/env node
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-const __dirname = dirname(fileURLToPath(import.meta.url));
-import(join(__dirname, '..', 'src', 'index.js'));
+import '../src/index.js';

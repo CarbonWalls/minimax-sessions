@@ -1,11 +1,11 @@
 // Safety layer:
 //  - detect whether a session is currently active/running
 //  - build a dry-run deletion plan from the LIVE schema (no hardcoded table list)
-//  - back up the database before a real destructive operation
-import { existsSync, mkdirSync } from 'node:fs';
+//  - back up the database before a real destructive operation (with retention)
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { SqliteAdapter, quoteIdent, isSessionKeyCol, CASCADE_ID_COLS } from './sqlite.js';
-import { MSM_BACKUP_DIR, DB_PATH } from './env.js';
+import { MSM_BACKUP_DIR, MSM_BACKUP_KEEP, DB_PATH } from './env.js';
 import { betterSqlite } from './sqlite.js';
 
 // Tables that are shared registries, not per-session data. Deleting a session
@@ -48,8 +48,10 @@ export class Safety {
     // 2) status column: 'started' means a turn is in flight
     try {
       const s = r.prepare('SELECT status FROM local_runtime_sessions WHERE session_id = ?').get(sessionId);
-      if (s && s.status === 'started') reasons.push(`status='${s.status}' (a turn is in flight)`);
-      if (s && s.status === 'started') return { active: true, reasons };
+      if (s && s.status === 'started') {
+        reasons.push(`status='${s.status}' (a turn is in flight)`);
+        return { active: true, reasons };
+      }
     } catch (e) { this.log?.debug(`status check failed: ${e.message}`); }
 
     // 3) agents registry: an agent whose main session this is and is alive
@@ -81,7 +83,7 @@ export class Safety {
   }
 
   // Build a deletion plan from the live schema. Every entry targets the exact
-  // session id only. Returns { entries: [{table, kind, where, params, count}], warnings }
+  // session id only. Returns { entries: [{table, kind, where, params, count, idCol?}], warnings }
   buildDeletePlan(sessionId) {
     const entries = [];
     const warnings = [];
@@ -113,7 +115,7 @@ export class Safety {
         const pcols = this.db.columns(parent).filter(isSessionKeyCol);
         const pwhere = pcols.map(pc => `${quoteIdent(pc)} = ?`).join(' OR ');
         entries.push({
-          table: t, kind: 'cascade',
+          table: t, kind: 'cascade', idCol: c,
           where: `${quoteIdent(c)} IN (SELECT ${quoteIdent(c)} FROM ${quoteIdent(parent)} WHERE ${pwhere})`,
           params: pcols.map(() => sessionId),
           count: null,
@@ -125,7 +127,7 @@ export class Safety {
     try {
       const a = this.db.read().prepare('SELECT agent_name, main_session_id FROM agents WHERE main_session_id = ?').get(sessionId);
       if (a) warnings.push(`agents.main_session_id of agent '${a.agent_name}' will dangle (left untouched; it is a shared registry row)`);
-    } catch {}
+    } catch { /* no agents table */ }
 
     // fill counts
     for (const e of entries) e.count = this.db.rowCount(e.table, e.where, e.params);
@@ -136,7 +138,8 @@ export class Safety {
   }
 
   // Online backup via SQLite's backup API. Never touches the live DB.
-  async backup({ label = 'pre-delete' } = {}) {
+  // Old backups beyond `keep` (default MSM_BACKUP_KEEP) are pruned afterwards.
+  async backup({ label = 'pre-delete', keep = MSM_BACKUP_KEEP } = {}) {
     mkdirSync(MSM_BACKUP_DIR, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '');
     const dest = path.join(MSM_BACKUP_DIR, `runtime-state-${stamp}-${label}.sqlite`);
@@ -145,9 +148,32 @@ export class Safety {
     try {
       await src.backup(dest);
       this.log?.info(`database backed up to ${dest}`);
-      return { path: dest };
     } finally {
-      try { src.close(); } catch {}
+      try { src.close(); } catch { /* already closed */ }
     }
+    const pruned = this._pruneBackups(keep);
+    if (pruned.length) this.log?.verbose(`pruned ${pruned.length} old backup(s): ${pruned.join(', ')}`);
+    return { path: dest, pruned };
+  }
+
+  // keep the newest `keep` backups; returns the removed file names
+  _pruneBackups(keep) {
+    const removed = [];
+    try {
+      if (!Number.isFinite(keep) || keep < 0) return removed;
+      const files = readdirSync(MSM_BACKUP_DIR)
+        .filter(f => f.endsWith('.sqlite'))
+        .map(f => {
+          const p = path.join(MSM_BACKUP_DIR, f);
+          let m = 0;
+          try { m = statSync(p).mtimeMs; } catch { /* vanished */ }
+          return { f, p, m };
+        })
+        .sort((a, b) => b.m - a.m);
+      for (const { f, p } of files.slice(keep)) {
+        try { unlinkSync(p); removed.push(f); } catch { /* leave it */ }
+      }
+    } catch { /* dir missing etc. */ }
+    return removed;
   }
 }

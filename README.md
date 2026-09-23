@@ -13,12 +13,14 @@ each operation is implemented the way it is.
 ## Requirements
 
 - `node` (>= 20; tested on v26)
-- the MiniMax Code installation at `/root/.minimax-code/releases/0.5.2/…`
-  (only used to load its already-installed `better-sqlite3` binding and to run
-  `mcode acp` — nothing in the install is ever modified)
+- the MiniMax Code installation at `/root/.minimax-code/releases/<newest>/…`
+  (auto-discovered; pin with `MSM_MCODE_RELEASE` / override root with
+  `MSM_MCODE_ROOT`. Only used to load its already-installed `better-sqlite3`
+  binding and to run `mcode acp` — nothing in the install is ever modified)
 - the runtime database at `/root/.minimax/v2/sqlite/runtime-state.sqlite`
 
 Both locations can be overridden with `MSM_RUNTIME_DATA_DIR` / `MSM_HOME`.
+Run `mcode-sessions doctor` if anything looks misconfigured.
 
 ## Install / run
 
@@ -88,30 +90,39 @@ typing the last 8 characters of the session id before anything is removed.
 ```
 mcode-sessions                       # interactive TUI (default)
 mcode-sessions list [text]           # list sessions
-mcode-sessions search <text>         # search by title
+mcode-sessions search <text>         # search title/purpose/id (--messages also hits bodies)
 mcode-sessions inspect <id>          # compact metadata
 mcode-sessions rename <id> <title>   # rename
 mcode-sessions archive <id>          # archive
 mcode-sessions unarchive <id>        # unarchive
 mcode-sessions fork <id>             # fork via the native runtime
 mcode-sessions delete <id>           # --dry-run by default; --confirm to run
-mcode-sessions export <id>           # --format json|markdown|metadata
+mcode-sessions export <id>           # --format markdown|json|jsonl|metadata  [--out FILE]
 mcode-sessions stats <id>            # usage / statistics
 mcode-sessions active <id>           # is it running?
 mcode-sessions plan <id>             # dry-run deletion plan
+mcode-sessions resume <id>           # launch mcode attached to a session (--dry-run to preview)
+mcode-sessions doctor                # environment / schema / native-runtime health check
 
-filters: --archived/--no-archived  --status <s>  --kind <k>  --workspace <dir>
-safety: --dry-run  --confirm  --no-backup  --session <id>
-output: --json  --ascii  --no-color  --debug/--verbose
+filters: --archived/--no-archived/--only-archived  --status <s>  --kind <k>
+         --workspace <dir>  --parent <id>
+safety:  --dry-run  --confirm  --no-backup  --session <id>
+output:  --json  --limit <n>  --offset <n>  --out <file>  --format <fmt>
+         --ascii  --no-color  --debug/--verbose
 ```
+
+Both `--flag value` and `--flag=value` forms are accepted. Unknown flags are
+collected and warned about (in the log) instead of being silently swallowed.
 
 Examples:
 
 ```bash
 mcode-sessions search "x posts"
+mcode-sessions list --limit 20 --no-archived
 mcode-sessions delete mvs_220667ba0ba94c14aa48225ae1e72540 --dry-run
 mcode-sessions delete mvs_220667ba0ba94c14aa48225ae1e72540 --confirm
-mcode-sessions export mvs_e16989c9a5da444bacbd447ac45ada5f --format json > s.json
+mcode-sessions export mvs_e16989c9a5da444bacbd447ac45ada5f --format jsonl --out s.jsonl
+mcode-sessions doctor
 ```
 
 ## How each operation works (short version)
@@ -137,29 +148,35 @@ is not listening). Those therefore use the conservative SQLite fallback — see
 - the deletion plan is computed by introspecting the schema at runtime and only
   ever targets `WHERE <session key> = <exact id>`
 - a database backup is written before the first real destructive operation
-  (unless `--no-backup`), and its path is printed
+  (unless `--no-backup`), and its path is printed; old backups are pruned to
+  the newest `MSM_BACKUP_KEEP` (default 20)
 - deletes run in one transaction; a row-count mismatch aborts and rolls back
-- after deleting, the tool verifies the session row and representative
-  dependents are gone, and reports leftovers if any
-- logs go to `~/.mcode-session-manager/logs/msm.log`, never into the MiniMax DB
+- after deleting, every planned table is re-counted; cascade children are
+  verified by the concrete ids captured *before* the parent row disappeared
+  (so a dead subquery cannot mask leftovers), and any remainder is reported
+- logs go to `~/.mcode-session-manager/logs/msm.log` (rotated at 1 MiB, keep 3),
+  never into the MiniMax DB
 
 ## Layout
 
 ```
 bin/mcode-sessions        entrypoint
-src/env.js                paths + flag parsing (no global env mutation)
-src/log.js                logger -> ~/.mcode-session-manager/logs/
+src/env.js                paths + flag parsing (auto-discovers newest mcode release)
+src/log.js                logger -> ~/.mcode-session-manager/logs/ (size-capped)
+src/format.js             shared age/id/title formatting for CLI + TUI
 src/sqlite.js             sqlite adapter (reuses mcode's better-sqlite3) + schema introspection
 src/acp.js                native ACP JSON-RPC client (stdio) — the real runtime interface
 src/discovery.js          session discovery: list/filter/count/messages/usage
-src/safety.js             active detection, dry-run plan builder, backup
+src/safety.js             active detection, dry-run plan builder, backup + retention
 src/lifecycle.js          rename / archive / fork / delete (native-first)
-src/inspect.js            inspect / stats / export
+src/inspect.js            inspect / stats / export (markdown|json|jsonl|metadata)
 src/theme.js              mcode `minimax` theme palette + colour degradation
 src/tui.js                keyboard-only terminal UI
-src/cli.js                CLI command surface
-tests/mutations.test.mjs  48 mutation checks against disposable sessions
-tests/tui.test.mjs        32 TUI state-machine checks
+src/cli.js                CLI command surface (incl. doctor, resume)
+tests/unit.test.mjs       fast pure-function tests (no DB required)
+tests/tui.test.mjs        headless TUI state-machine checks
+tests/mutations.test.mjs  mutation checks against disposable sessions
+tools/scratch-ctx.mjs     RESEARCH helper (bounded context around a regex)
 RESEARCH.md               reverse-engineering report for every operation
 ```
 
@@ -202,9 +219,13 @@ Behaviour details, all matching how mcode itself behaves:
 ## Tests
 
 ```bash
-node tests/mutations.test.mjs    # creates disposable sessions, mutates, verifies the DB
-node tests/tui.test.mjs          # headless TUI: keys, screens, two-step delete confirm
+npm test                # unit + tui + mutations
+npm run test:unit       # fast pure-function checks (no DB / no mcode needed)
+npm run test:tui        # headless TUI: keys, screens, two-step delete confirm
+npm run test:mutations  # creates disposable sessions, mutates, verifies the DB
+npm run doctor          # environment / schema / native ACP health check
 ```
 
-Both exit non-zero on any failure. Sessions created for the tests are removed by
-the tests themselves.
+All suites exit non-zero on any failure. Sessions created by the mutation/TUI
+suites are removed by those suites themselves. Paths are resolved relative to
+the checkout, so a clone under `projects/` runs its own tests against itself.

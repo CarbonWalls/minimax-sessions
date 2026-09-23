@@ -1,5 +1,8 @@
 // Inspect / stats / export. All read-only.
 import { Discovery } from './discovery.js';
+import { iso } from './format.js';
+
+export const EXPORT_FORMATS = ['markdown', 'json', 'jsonl', 'metadata'];
 
 export class Inspector {
   constructor({ log, db } = {}) {
@@ -14,7 +17,7 @@ export class Inspector {
     const usage = this.d.tokenUsage(id);
     const children = this.d.childCount(id);
     const locks = this.d.db.read().prepare(
-      `SELECT owner_id, owner_kind, acquired_at_ms, expires_at_ms FROM local_runtime_session_locks WHERE session_id = ?`
+      'SELECT owner_id, owner_kind, acquired_at_ms, expires_at_ms FROM local_runtime_session_locks WHERE session_id = ?'
     ).all(id);
     return { session: s, messageCount: msgs, tokenUsage: usage, childSessionCount: children, locks };
   }
@@ -28,26 +31,43 @@ export class Inspector {
     const diffs = this.d.db.read().prepare('SELECT count(*) n FROM local_runtime_turn_diffs WHERE session_id = ?').get(id).n;
     const approx = this.d.approxRowCount(id);
     const last = this.d.lastActivityMs(id);
-    return { sessionId: id, title: s.title, status: s.status, archived: !!s.archived,
-             messageCount: byRole.reduce((a, r) => a + r.n, 0), messagesByRole: byRole,
-             turnCount: turns, turnDiffCount: diffs,
-             tokenUsage: usage, approxDbRows: approx, lastActivityMs: last };
+    return {
+      sessionId: id, title: s.title, status: s.status, archived: !!s.archived,
+      messageCount: byRole.reduce((a, r) => a + r.n, 0), messagesByRole: byRole,
+      turnCount: turns, turnDiffCount: diffs,
+      tokenUsage: usage, approxDbRows: approx, lastActivityMs: last,
+    };
   }
 
   export(id, { format = 'markdown' } = {}) {
+    if (!EXPORT_FORMATS.includes(format)) {
+      throw new Error(`unknown export format: ${format} (use ${EXPORT_FORMATS.join('|')})`);
+    }
     const s = this.d.getSession(id);
     if (!s) throw new Error(`session not found: ${id}`);
     const msgs = this.d.messages(id, { limit: 100000 });
     const meta = { ...s };
+    const parse = m => {
+      try { return JSON.parse(m.data_json); } catch { return { raw: m.data_json }; }
+    };
     if (format === 'json') {
       return {
         meta,
-        messages: msgs.map(m => {
-          let data = null;
-          try { data = JSON.parse(m.data_json); } catch { data = { raw: m.data_json }; }
-          return { msg_id: m.msg_id, role: m.role, turn_id: m.turn_id, created_at_ms: m.created_at_ms, source: m.source, data };
-        }),
+        messages: msgs.map(m => ({
+          msg_id: m.msg_id, role: m.role, turn_id: m.turn_id,
+          created_at_ms: m.created_at_ms, source: m.source, data: parse(m),
+        })),
       };
+    }
+    if (format === 'jsonl') {
+      const lines = [JSON.stringify({ type: 'meta', ...meta })];
+      for (const m of msgs) {
+        lines.push(JSON.stringify({
+          type: 'message', msg_id: m.msg_id, role: m.role, turn_id: m.turn_id,
+          created_at_ms: m.created_at_ms, source: m.source, data: parse(m),
+        }));
+      }
+      return lines.join('\n') + '\n';
     }
     if (format === 'metadata') return meta;
     // markdown
@@ -64,8 +84,7 @@ export class Inspector {
     lines.push('## Conversation');
     lines.push('');
     for (const m of msgs) {
-      let data = null;
-      try { data = JSON.parse(m.data_json); } catch { data = { msg_content: String(m.data_json).slice(0, 200) }; }
+      const data = parse(m);
       const role = m.role || (data?.role ?? 'unknown');
       const content = data?.msg_content ?? data?.content ?? '';
       const files = Array.isArray(data?.files) ? data.files : null;
@@ -77,11 +96,4 @@ export class Inspector {
     }
     return lines.join('\n');
   }
-}
-
-function iso(ms) {
-  if (ms == null) return '?';
-  const n = Number(ms);
-  if (!Number.isFinite(n)) return '?';
-  try { return new Date(n).toISOString(); } catch { return String(n); }
 }
