@@ -89,6 +89,7 @@ export class Tui {
     this.pendingExec = null;
     this._resolve = null;
     this._alt = false;   // alternate screen buffer entered?
+    this._prevLines = null; // previous frame, for minimal in-place repainting
     this._outputScroll = 0;
     this.searchBuf = '';
     this.searchRows = null;
@@ -106,8 +107,10 @@ export class Tui {
     stdin.setEncoding('utf8');
     this._restore = () => { try { stdin.setRawMode(false); } catch {} };
     process.on('SIGINT', () => this.quit(0));
-    // refit on resize: the page size changes, so reload the window and repaint
-    this._sigwinch = () => { this.refresh(); this.render(); };
+    // refit on resize: the page size changes, so reload the window and repaint.
+    // The previous frame is dropped so the next render is a full repaint (the
+    // terminal may have rewrapped everything, so a diff would be wrong).
+    this._sigwinch = () => { this._prevLines = null; this.refresh(); this.render(); };
     process.on('SIGWINCH', this._sigwinch);
 
     this.refresh();
@@ -134,6 +137,7 @@ export class Tui {
   }
   _done(code) { if (this._resolve) { const r = this._resolve; this._resolve = null; r(code); } }
   _leaveAlt() {
+    this._prevLines = null;
     if (this._alt) { this._alt = false; process.stdout.write('\x1b[?25h\x1b[?1049l\x1b[H\x1b[2J'); }
   }
   destroy() { this._leaveAlt(); try { this.db.close(); } catch {} }
@@ -527,6 +531,14 @@ export class Tui {
   }
 
   // ------------------------------------------------------------- render
+  // Minimal in-place repaint. The previous frame is remembered and only the
+  // lines that actually CHANGED are written, positioned with absolute cursor
+  // addressing. Moving the cursor therefore emits ~2 lines (~0.5 KB) instead of
+  // a full ~4.7 KB frame; that keeps every update well under the tty output
+  // buffer (~4 KB) so the terminal can never paint a half-written frame — that
+  // half-frame is what looked like the whole screen flashing and the header
+  // briefly appearing over a stale body. One batched stdout write per frame,
+  // \r\n line endings, no trailing newline, so the screen never scrolls.
   render() {
     const W = this.width;
     const g = this.glyphs;
@@ -543,13 +555,29 @@ export class Tui {
 
     while (out.length < this.height) out.push('');
     out = out.slice(0, this.height);
-    // paint in place: enter the alternate screen buffer once, then move home
-    // and erase each line on every frame. \r\n line endings so raw-mode
-    // terminals don't staircase; no trailing newline so the screen never
-    // scrolls and the header can never stack up.
+
+    const prev = this._prevLines;
+    this._prevLines = out;
+    // enter the alternate screen buffer + hide the cursor exactly once
     const pre = this._alt ? '' : (this._alt = true, '\x1b[?1049h\x1b[?25l');
-    const body = out.map(l => l + '\x1b[K').join('\r\n');
-    process.stdout.write('\x1b[H' + pre + body + '\x1b[J');
+
+    // first frame, after a resize, or after leaving the alt buffer: full paint
+    if (!prev || prev.length !== out.length) {
+      process.stdout.write('\x1b[H' + pre + out.map(l => l + '\x1b[K').join('\r\n') + '\x1b[J');
+      return;
+    }
+    const changed = [];
+    for (let i = 0; i < out.length; i++) if (out[i] !== prev[i]) changed.push(i);
+    if (!changed.length) return; // identical frame: emit nothing at all
+    // if most of the screen moved, a plain full repaint is cheaper than a long
+    // run of cursor-move prefixes (and still lands as one batched write)
+    if (changed.length > Math.max(4, out.length >> 1)) {
+      process.stdout.write('\x1b[H' + pre + out.map(l => l + '\x1b[K').join('\r\n') + '\x1b[J');
+      return;
+    }
+    let buf = '';
+    for (const i of changed) buf += `\x1b[${i + 1};1H${out[i]}\x1b[K`;
+    process.stdout.write(pre + buf);
   }
 
   // the "current/total" position, plus whether more rows exist off-screen

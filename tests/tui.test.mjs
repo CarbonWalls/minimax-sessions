@@ -45,10 +45,11 @@ t.destroy();
 
 const ui = new Tui({ flags, log });
 let captured = '';
+const writeSizes = [];
 const realWrite = process.stdout.write.bind(process.stdout);
-process.stdout.write = s => { captured += s; return true; };
+process.stdout.write = s => { captured += s; writeSizes.push(Buffer.from(s).length); return true; };
 const screen = () => captured;
-const reset = () => { captured = ''; };
+const reset = () => { captured = ''; writeSizes.length = 0; };
 const has = re => re.test(screen());
 const press = keys => { reset(); ui.onKey(keys); };
 
@@ -59,10 +60,31 @@ try {
   ok('browser renders the target row', /msm-tui-target/.test(screen()));
   ok('browser shows total count', new RegExp(`n=${ui.total}`).test(screen()));
 
-  // narrow-mode degradation
-  const wide = process.stdout.columns;
-  reset(); ui.render();
+  // row content: a cursor move repaints just the affected rows, so the status
+  // text must still be present in the (now minimal) diff output.
+  reset(); ui.onKey('\x1b[B'); // down
   ok('rows show status + archived marker', /\b(idle|aborted|error|started)/.test(screen()));
+
+  // flicker-free rendering (the regression this guards):
+  //  * a cursor move is exactly ONE batched stdout write — multiple small
+  //    writes let the terminal paint a half-written frame (that was the flash)
+  //  * that write is small, so it never exceeds the ~4 KB tty output buffer
+  //    and the terminal can never split it across two paints
+  //  * the header (row 1) and its rule (row 2) are never rewritten when only
+  //    the cursor moved, so they cannot flash
+  //  * no full-screen clear ([2J) during navigation
+  //  * under --no-color, not one SGR code is emitted (only screen-control)
+  ok('cursor move is a single batched write', writeSizes.length === 1, `${JSON.stringify(writeSizes)}`);
+  // a cursor move repaints ~2 rows + the footer, not the whole screen: this
+  // must stay far below both a full frame (~3.7 KB) and the tty buffer (~4 KB)
+  ok('cursor move write stays under the tty buffer', writeSizes[0] < 1500, `${writeSizes[0]} bytes`);
+  ok('header row not rewritten on cursor move', !/\x1b\[1;1H/.test(screen()) && !/\x1b\[2;1H/.test(screen()));
+  ok('no full-screen clear while navigating', !/\x1b\[2J/.test(screen()));
+  ok('no SGR colour codes under --no-color', !/\x1b\[[0-9;]*m/.test(screen()));
+  // an identical frame must emit nothing at all (this is the whole point of
+  // the diff renderer — a redundant render() must not repaint the screen)
+  reset(); ui.render();
+  ok('identical frame emits nothing', writeSizes.length === 0, `${JSON.stringify(writeSizes)}`);
 
   // search flow
   ui.onKey('/');

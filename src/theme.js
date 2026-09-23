@@ -156,7 +156,12 @@ export class Theme {
   // one composable opener + single reset; attrs: {fg,bg,bold,dim,italic}
   style(spec, text) {
     const t = String(text ?? '');
-    if (!this.on) return t;
+    // colourising an EMPTY span emits a full SGR open+close around nothing:
+    // it has no visual effect at all, only bytes. Eliding it keeps frames
+    // small (rows have several optional fields that are often empty) so a full
+    // repaint stays under the tty output buffer and never lands as a
+    // half-painted frame.
+    if (!this.on || t === '') return t;
     const parts = [];
     if (spec.bold) parts.push('\x1b[1m');
     if (spec.dim) parts.push('\x1b[2m');
