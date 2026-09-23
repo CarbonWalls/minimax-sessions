@@ -1,15 +1,24 @@
 // Small-screen-friendly terminal UI. No mouse, no framework; raw stdin + ANSI.
-// Degrades to plain ASCII with --ascii and to number+title+status on narrow
-// terminals. Handles resize (SIGWINCH) and Ctrl-C cleanly.
+//
+// Rendering: full-screen alternate buffer, cursor home + per-line erase on every
+// frame, so each repaint lands in the same place (no scrolling / stacked
+// headers), and SIGWINCH refits live. Colour comes from mcode's OWN `minimax`
+// theme palette (see theme.js), degrading through truecolor -> 256 -> 16 ->
+// plain. `--no-color` emits no SGR at all; `--ascii` uses plain-ASCII glyphs.
+//
+// Scrolling: windowed. Only one screen-full of rows is fetched at a time and
+// the next/previous window loads as the cursor reaches the edge; the footer
+// always shows x(current)/y(total), and pushing past either end wraps around.
 import { spawn } from 'node:child_process';
 import { Discovery } from './discovery.js';
 import { Lifecycle } from './lifecycle.js';
 import { Inspector } from './inspect.js';
 import { SqliteAdapter } from './sqlite.js';
 import { MCODE_BIN, dbExists, mcodeBinExists } from './env.js';
+import { Theme, dispWidth, padTo } from './theme.js';
 
-const GLYPHS_ASCII = { h: '-', v: '|', arrow: '>', ok: 'ok', warn: '!' };
-const GLYPHS_UNICODE = { h: '─', v: '│', arrow: '›', ok: '✓', warn: '⚠' };
+const GLYPHS_ASCII = { h: '-', v: '|', arrow: '>', ok: 'ok', warn: '!', up: '^', down: 'v', cursor: '_' };
+const GLYPHS_UNICODE = { h: '─', v: '│', arrow: '›', ok: '✓', warn: '⚠', up: '↑', down: '↓', cursor: '▏' };
 
 const ACTION_MENU = [
   ['1', 'open / resume'],
@@ -25,6 +34,14 @@ const ACTION_MENU = [
 ];
 const DEFAULT_MENU_IDX = 6; // 'inspect' — never 'delete'
 
+// status string -> mcode colour role
+function statusRole(s) {
+  if (s === 'started') return 'signal';
+  if (s === 'error') return 'error';
+  if (s === 'aborted') return 'warning';
+  return 'dim';
+}
+
 export async function runTui({ flags, log }) {
   if (!dbExists()) {
     process.stderr.write('runtime database not found. Set MSM_RUNTIME_DATA_DIR or check the install.\n');
@@ -39,7 +56,8 @@ export class Tui {
   constructor({ flags, log }) {
     this.flags = flags;
     this.log = log;
-    this.color = flags.color && process.env.NO_COLOR == null;
+    this.theme = new Theme({ color: flags.color });
+    this.color = this.theme.on; // kept for compatibility
     this.glyphs = flags.ascii ? GLYPHS_ASCII : GLYPHS_UNICODE;
     this.db = new SqliteAdapter({ log });
     this.discovery = new Discovery({ log, db: this.db });
@@ -47,8 +65,8 @@ export class Tui {
     this.inspector = new Inspector({ log, db: this.db });
 
     this.screen = 'browser';
-    this.cursor = 0;
-    this.page = 0;
+    this.cursor = 0;      // index into the current window of rows
+    this.offset = 0;      // absolute index of rows[0] within the filtered set
     this.rows = [];
     this.total = 0;
     this.filters = { archived: flags.includeArchived === false ? 'exclude' : 'include' };
@@ -70,6 +88,11 @@ export class Tui {
     this.confirmToken = '';
     this.pendingExec = null;
     this._resolve = null;
+    this._alt = false;   // alternate screen buffer entered?
+    this._outputScroll = 0;
+    this.searchBuf = '';
+    this.searchRows = null;
+    this._searchKey = null;
   }
 
   async run() {
@@ -83,7 +106,8 @@ export class Tui {
     stdin.setEncoding('utf8');
     this._restore = () => { try { stdin.setRawMode(false); } catch {} };
     process.on('SIGINT', () => this.quit(0));
-    this._sigwinch = () => { this.cursor = 0; this.render(); };
+    // refit on resize: the page size changes, so reload the window and repaint
+    this._sigwinch = () => { this.refresh(); this.render(); };
     process.on('SIGWINCH', this._sigwinch);
 
     this.refresh();
@@ -95,7 +119,7 @@ export class Tui {
   quit(code) {
     if (this._restore) this._restore();
     try { process.stdin.removeAllListeners('data'); process.stdin.pause(); } catch {}
-    process.stdout.write('\x1b[2J\x1b[H');
+    this._leaveAlt();
     if (this.pendingExec) {
       const { args } = this.pendingExec;
       process.stdout.write(`launching: mcode ${args.join(' ')}\n`);
@@ -109,15 +133,20 @@ export class Tui {
     this._done(code);
   }
   _done(code) { if (this._resolve) { const r = this._resolve; this._resolve = null; r(code); } }
-  destroy() { try { this.db.close(); } catch {} }
+  _leaveAlt() {
+    if (this._alt) { this._alt = false; process.stdout.write('\x1b[?25h\x1b[?1049l\x1b[H\x1b[2J'); }
+  }
+  destroy() { this._leaveAlt(); try { this.db.close(); } catch {} }
 
   get width() { return Math.max(20, process.stdout.columns || 80); }
   get height() { return Math.max(8, process.stdout.rows || 24); }
-  get pageSize() { return Math.max(3, this.height - 8); }
+  // rows that fit between the browser header and footer
+  get pageSize() { return Math.max(3, this.height - 6); }
 
   onKey(chunk) {
     for (const k of decodeKeys(chunk)) {
-      if (this.screen === 'input') this.handleInputKey(k);
+      if (this.screen === 'search') this.handleSearchKey(k);
+      else if (this.screen === 'input') this.handleInputKey(k);
       else if (this.screen === 'confirm') this.handleConfirmKey(k);
       else if (this.screen === 'output') this.handleOutputKey(k);
       else if (this.screen === 'filter') this.handleFilterKey(k);
@@ -130,11 +159,14 @@ export class Tui {
   handleBrowserKey(k) {
     const n = this.rows.length;
     if (k.name === 'ctrlc') return this.quit(0);
-    if (k.char === 'q' || k.name === 'escape') return this.quit(0);
-    if (k.name === 'up' || k.char === 'k') { this.cursor = Math.max(0, this.cursor - 1); return this.render(); }
-    if (k.name === 'down' || k.char === 'j') { this.cursor = Math.min(n - 1, this.cursor + 1); return this.render(); }
-    if (k.name === 'home' || k.char === 'g') { this.cursor = 0; return this.render(); }
-    if (k.name === 'end' || k.char === 'G') { this.cursor = n - 1; return this.render(); }
+    if (k.name === 'escape') return;
+    if (k.char === 'q') return this.quit(0);
+    if (k.name === 'up' || k.char === 'k') return this.moveUp();
+    if (k.name === 'down' || k.char === 'j') return this.moveDown();
+    if (k.name === 'right' || k.char === 'l') return this.moveDown();
+    if (k.name === 'left' || k.char === 'h') return this.moveUp();
+    if (k.name === 'home' || k.char === 'g') return this.goTop();
+    if (k.name === 'end' || k.char === 'G') return this.goBottom();
     if (k.name === 'pgdn' || k.name === 'space' || k.char === 'n') return this.nextPage();
     if (k.name === 'pgup' || k.char === 'b' || k.char === 'p') return this.prevPage();
     if (k.name === 'enter') return this.openMenu(this.rows[this.cursor]);
@@ -147,6 +179,106 @@ export class Tui {
     if (k.char === 'x') return this.clearFilters();
     if (k.char && /[1-9]/.test(k.char)) { const idx = Number(k.char) - 1; if (idx < n) return this.openMenu(this.rows[idx]); }
     if (k.char === '0') { if (9 < n) return this.openMenu(this.rows[9]); }
+  }
+
+  // windowed scrolling ------------------------------------------------
+  // Only `pageSize` rows are held at once. Reaching the edge loads the next or
+  // previous window; pushing past the last/first row wraps to the other end.
+  moveDown() {
+    const n = this.rows.length;
+    if (n === 0) return;
+    if (this.cursor < n - 1) { this.cursor++; return this.render(); }
+    if (this.offset + n < this.total) { this.offset += n; this.refresh(); this.cursor = 0; return this.render(); }
+    return this.goTop(); // past the end -> wrap to the top
+  }
+  moveUp() {
+    const n = this.rows.length;
+    if (n === 0) return;
+    if (this.cursor > 0) { this.cursor--; return this.render(); }
+    if (this.offset > 0) { this.offset = Math.max(0, this.offset - this.pageSize); this.refresh(); this.cursor = this.rows.length - 1; return this.render(); }
+    return this.goBottom(); // above the top -> wrap to the bottom
+  }
+  goTop() { this.offset = 0; this.refresh(); this.cursor = 0; this.render(); }
+  goBottom() {
+    const ps = this.pageSize;
+    this.offset = Math.max(0, (Math.ceil(this.total / ps) - 1) * ps);
+    this.refresh();
+    this.cursor = Math.max(0, this.rows.length - 1);
+    this.render();
+  }
+  nextPage() {
+    const ps = this.pageSize;
+    if (this.offset + this.rows.length < this.total) { this.offset = Math.min(this.offset + ps, Math.max(0, this.total - 1)); this.refresh(); this.cursor = 0; }
+    else this.goTop();
+    this.render();
+  }
+  prevPage() {
+    if (this.offset > 0) { this.offset = Math.max(0, this.offset - this.pageSize); this.refresh(); this.cursor = 0; }
+    else this.goBottom();
+    this.render();
+  }
+
+  cycleArchived() {
+    const order = ['include', 'exclude', 'only'];
+    this.filters.archived = order[(order.indexOf(this.filters.archived ?? 'include') + 1) % 3];
+    this.offset = 0; this.cursor = 0; this.refresh(); this.render();
+  }
+  clearFilters() { this.filters = { archived: 'include' }; this.offset = 0; this.cursor = 0; this.refresh(); this.message = 'filters cleared'; this.messageKind = 'info'; this.render(); }
+
+  openFilter(kind) {
+    this.filterKind = kind;
+    let opts;
+    if (kind === 'status') opts = this.discovery.statuses().map(r => ({ v: r.status, label: `${r.status} (${r.n})` }));
+    else if (kind === 'kind') opts = this.discovery.kinds().map(r => ({ v: r.session_kind, label: `${r.session_kind} (${r.n})` }));
+    else opts = this.discovery.workspaces().map(r => ({ v: r.workspace_dir, label: `${r.workspace_dir} (${r.n})` }));
+    this.foptions = [{ v: null, label: '(all)' }, ...opts];
+    this.fcursor = 0;
+    this.prevScreen = 'browser';
+    this.screen = 'filter';
+    this.render();
+  }
+  applyFilter(opt) {
+    const kind = this.filterKind;
+    if (!opt || opt.v == null) delete this.filters[kind];
+    else this.filters[kind] = opt.v;
+    this.offset = 0; this.cursor = 0; this.refresh();
+    this.screen = 'browser';
+    this.render();
+  }
+
+  // -------------------------------------------------------------- search
+  // live: results filter on every keystroke, enter commits, esc discards
+  beginSearch() {
+    this.searchBuf = this.filters.q ?? '';
+    this.searchRows = null;
+    this.prevScreen = 'browser';
+    this.screen = 'search';
+    this.render();
+  }
+  get searchResults() {
+    const q = this.searchBuf.trim();
+    const key = q + '\u0000' + JSON.stringify(this.filters.archived);
+    if (this.searchRows && this._searchKey === key) return this.searchRows;
+    this._searchKey = key;
+    const { rows, total } = this.discovery.list({
+      limit: this.pageSize, offset: 0,
+      filters: { ...this.filters, ...(q ? { q } : {}) },
+    });
+    this.searchRows = { rows, total, q };
+    return this.searchRows;
+  }
+  handleSearchKey(k) {
+    if (k.name === 'ctrlc') return this.quit(0);
+    if (k.name === 'escape') { this.screen = 'browser'; return this.render(); }
+    if (k.name === 'backspace') { this.searchBuf = this.searchBuf.slice(0, -1); this.searchRows = null; return this.render(); }
+    if (k.name === 'enter') {
+      const q = this.searchBuf.trim();
+      if (q) this.filters.q = q; else delete this.filters.q;
+      this.offset = 0; this.cursor = 0; this.refresh();
+      this.screen = 'browser';
+      return this.render();
+    }
+    if (k.char && k.char >= ' ' && k.char <= '~') { this.searchBuf += k.char; this.searchRows = null; return this.render(); }
   }
 
   // ---------------------------------------------------------------- menu
@@ -201,6 +333,9 @@ export class Tui {
   // --------------------------------------------------------------- output
   handleOutputKey(k) {
     if (k.name === 'ctrlc') return this.quit(0);
+    if (k.name === 'up' || k.char === 'k') { this._outputScroll = Math.max(0, this._outputScroll - 1); return this.render(); }
+    if (k.name === 'down' || k.char === 'j') { this._outputScroll = this._outputScroll + 1; return this.render(); }
+    this._outputScroll = 0;
     this.screen = this.prevScreen || 'browser';
     this.render();
   }
@@ -217,54 +352,12 @@ export class Tui {
 
   // -------------------------------------------------------------- actions
   refresh() {
-    const { rows, total } = this.discovery.list({ limit: this.pageSize, offset: this.page * this.pageSize, filters: this.filters });
+    const { rows, total } = this.discovery.list({ limit: this.pageSize, offset: this.offset, filters: this.filters });
     this.rows = rows;
     this.total = total;
+    if (rows.length === 0 && this.offset > 0) { this.offset = 0; }
     if (this.cursor >= rows.length) this.cursor = Math.max(0, rows.length - 1);
-    this.log?.verbose(`refresh page=${this.page} rows=${rows.length} total=${total} filters=${JSON.stringify(this.filters)}`);
-  }
-  nextPage() { if ((this.page + 1) * this.pageSize < this.total) { this.page++; this.cursor = 0; this.refresh(); } this.render(); }
-  prevPage() { if (this.page > 0) { this.page--; this.cursor = 0; this.refresh(); } this.render(); }
-
-  cycleArchived() {
-    const order = ['include', 'exclude', 'only'];
-    this.filters.archived = order[(order.indexOf(this.filters.archived ?? 'include') + 1) % 3];
-    this.page = 0; this.cursor = 0; this.refresh(); this.render();
-  }
-  clearFilters() { this.filters = { archived: 'include' }; this.page = 0; this.cursor = 0; this.refresh(); this.message = 'filters cleared'; this.render(); }
-
-  openFilter(kind) {
-    this.filterKind = kind;
-    let opts;
-    if (kind === 'status') opts = this.discovery.statuses().map(r => ({ v: r.status, label: `${r.status} (${r.n})` }));
-    else if (kind === 'kind') opts = this.discovery.kinds().map(r => ({ v: r.session_kind, label: `${r.session_kind} (${r.n})` }));
-    else opts = this.discovery.workspaces().map(r => ({ v: r.workspace_dir, label: `${r.workspace_dir} (${r.n})` }));
-    this.foptions = [{ v: null, label: '(all)' }, ...opts];
-    this.fcursor = 0;
-    this.prevScreen = 'browser';
-    this.screen = 'filter';
-    this.render();
-  }
-  applyFilter(opt) {
-    const kind = this.filterKind;
-    if (!opt || opt.v == null) delete this.filters[kind];
-    else this.filters[kind] = opt.v;
-    this.page = 0; this.cursor = 0; this.refresh();
-    this.screen = 'browser';
-    this.render();
-  }
-
-  beginSearch() {
-    this.inputPrompt = 'search title:';
-    this.inputBuf = this.filters.q ?? '';
-    this.prevScreen = 'browser';
-    this.screen = 'input';
-    this.inputCb = v => {
-      if (v.trim()) this.filters.q = v.trim(); else delete this.filters.q;
-      this.page = 0; this.cursor = 0; this.refresh();
-      this.screen = 'browser'; this.render();
-    };
-    this.render();
+    this.log?.verbose(`refresh offset=${this.offset} rows=${rows.length} total=${total} filters=${JSON.stringify(this.filters)}`);
   }
 
   openMenu(row) {
@@ -328,6 +421,7 @@ export class Tui {
       ...d.locks.map(l => `lock: ${l.owner_kind} acquired ${iso(l.acquired_at_ms)} expires ${iso(l.expires_at_ms)}`),
       ...(x.error_message ? [`error: ${x.error_message}`] : []),
     ].join('\n');
+    this._outputScroll = 0;
     this.prevScreen = 'menu';
     this.screen = 'output';
     this.render();
@@ -345,6 +439,7 @@ export class Tui {
       `db rows belonging to session: ~${st.approxDbRows.total}`,
       `last activity: ${iso(st.lastActivityMs)}`,
     ].join('\n');
+    this._outputScroll = 0;
     this.prevScreen = 'menu';
     this.screen = 'output';
     this.render();
@@ -353,6 +448,7 @@ export class Tui {
   showExport(s) {
     this.outputTitle = 'export (markdown preview; use `export --format json` for full data)';
     this.outputText = this.inspector.export(s.session_id, { format: 'markdown' });
+    this._outputScroll = 0;
     this.prevScreen = 'menu';
     this.screen = 'output';
     this.render();
@@ -384,6 +480,7 @@ export class Tui {
         'stop or cancel the session first (let the turn finish, or close the',
         'owning process), then retry the delete.',
       ].join('\n');
+      this._outputScroll = 0;
       this.prevScreen = 'menu';
       this.screen = 'output';
       return this.render();
@@ -421,6 +518,7 @@ export class Tui {
     }
     this.outputTitle = 'delete result';
     this.outputText = L.join('\n');
+    this._outputScroll = 0;
     this.prevScreen = 'browser';
     this.screen = 'output';
     this.selected = null;
@@ -430,154 +528,229 @@ export class Tui {
 
   // ------------------------------------------------------------- render
   render() {
-    const out = [];
     const W = this.width;
     const g = this.glyphs;
-    const line = g.h.repeat(Math.max(4, Math.min(W, 72)));
-    if (this.screen === 'browser') out.push(...this.renderBrowser(W, line));
-    else if (this.screen === 'menu') out.push(...this.renderMenu(W, line));
-    else if (this.screen === 'confirm') out.push(...this.renderConfirm(W, line));
-    else if (this.screen === 'input') out.push(...this.renderInput(W, line));
-    else if (this.screen === 'filter') out.push(...this.renderFilter(W, line));
-    else if (this.screen === 'output') out.push(...this.renderOutput(W, line));
+    const line = g.h.repeat(W);
+    let out;
+    if (this.screen === 'browser') out = this.renderBrowser(W, line);
+    else if (this.screen === 'search') out = this.renderSearch(W, line);
+    else if (this.screen === 'menu') out = this.renderMenu(W, line);
+    else if (this.screen === 'confirm') out = this.renderConfirm(W, line);
+    else if (this.screen === 'input') out = this.renderInput(W, line);
+    else if (this.screen === 'filter') out = this.renderFilter(W, line);
+    else if (this.screen === 'output') out = this.renderOutput(W, line);
+    else out = [''];
 
     while (out.length < this.height) out.push('');
-    const body = out.slice(0, this.height).join('\n');
-    process.stdout.write('\x1b[H' + (this.color ? '\x1b[2J' : '') + body + '\n');
+    out = out.slice(0, this.height);
+    // paint in place: enter the alternate screen buffer once, then move home
+    // and erase each line on every frame. \r\n line endings so raw-mode
+    // terminals don't staircase; no trailing newline so the screen never
+    // scrolls and the header can never stack up.
+    const pre = this._alt ? '' : (this._alt = true, '\x1b[?1049h\x1b[?25l');
+    const body = out.map(l => l + '\x1b[K').join('\r\n');
+    process.stdout.write('\x1b[H' + pre + body + '\x1b[J');
+  }
+
+  // the "current/total" position, plus whether more rows exist off-screen
+  positionInfo() {
+    const cur = this.rows.length ? this.offset + this.cursor + 1 : 0;
+    return { cur, total: this.total };
   }
 
   renderBrowser(W, line) {
+    const g = this.glyphs;
     const f = this.filters;
     const fac = this.discovery.facetCounts();
-    const rows = [
-      ` mcode sessions  n=${this.total}  archived=${fac.archived}  locked=${fac.active}`,
-      line,
-    ];
-    const start = this.page * this.pageSize + 1;
-    if (!this.rows.length) rows.push('(no sessions match — / search, x clear filters)');
+    const T = this.theme;
+    const { cur, total } = this.positionInfo();
+    const moreUp = this.offset > 0;
+    const moreDown = this.offset + this.rows.length < total;
+    const head = T.style({ bold: true, fg: 'brand' }, ' mcode sessions')
+      + '  ' + T.fg('muted', `n=${total}`) + '  ' + T.fg('warning', `archived=${fac.archived}`)
+      + '  ' + T.fg('signal', `locked=${fac.active}`)
+      + (moreUp || moreDown ? '  ' + T.fg('dim', `${moreUp ? g.up : ''}${moreDown ? g.down : ''}`) : '');
+    const rows = [head, T.fg('border', line)];
+    const start = this.offset + 1;
+    if (!this.rows.length) rows.push(T.fg('muted', '(no sessions match — / search, x clear filters)'));
     for (let i = 0; i < this.rows.length; i++) rows.push(this.formatRow(this.rows[i], start + i, W, i === this.cursor));
-    rows.push(line);
+    rows.push(T.fg('border', line));
     const fdesc = [
       f.archived === 'exclude' ? 'no-arch' : f.archived === 'only' ? 'arch-only' : 'arch-in',
       f.q ? `q:"${f.q}"` : null, f.status ? `status=${f.status}` : null,
       f.kind ? `kind=${f.kind}` : null, f.workspace ? `ws=${shortWs(f.workspace)}` : null,
     ].filter(Boolean).join(' ');
-    const pageTxt = this.total > this.pageSize ? `page ${this.page + 1}/${Math.max(1, Math.ceil(this.total / this.pageSize))}  ` : '';
-    rows.push(pageTxt + fdesc);
+    const pos = T.style({ bold: true, fg: 'signal' }, `${cur}/${total}`);
+    rows.push(` ${pos}  ${T.fg('muted', fdesc)}`);
     const hint = W < 46
-      ? 'num/enter open  j/k move  q quit  / search  r refresh'
+      ? 'j/k move  / search  enter open  n/b page  x clear  q quit'
       : 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r refresh  q quit';
-    rows.push((this.message ? this.colored(this.message, this.messageKind) + '  ' : '') + hint);
+    rows.push((this.message ? this.colored(this.message, this.messageKind) + '  ' : '') + T.fg('dim', hint));
     this.message = '';
     return rows;
   }
 
   formatRow(r, n, W, sel) {
-    const marker = sel ? this.glyphs.arrow : ' ';
+    const g = this.glyphs;
+    const T = this.theme;
+    const status = r.status ?? '?';
     const arch = r.archived ? ' [arch]' : '';
     const kind = r.session_kind && r.session_kind !== 'conversation' ? ` <${r.session_kind[0]}>` : '';
     const age = relAge(r.updated_at_ms);
     const ws = (!r.workspace_dir || r.workspace_dir === '/root') ? '' : ` @${shortWs(r.workspace_dir)}`;
+    const num = String(n).padStart(W < 46 ? 2 : 3);
     if (W < 46) {
-      const title = trunc(r.title ?? '(untitled)', Math.max(6, W - 15));
-      return `${marker}${String(n).padStart(2)} ${title} ${r.status}${arch}`.slice(0, W);
+      const titleW = Math.max(6, W - 2 - dispWidth(status) - dispWidth(arch) - dispWidth(num));
+      const title = truncW(r.title ?? '(untitled)', titleW);
+      const plain = `${sel ? g.arrow : ' '}${num} ${title} ${status}${arch}`;
+      if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
+      return [
+        T.fg('dim', num), ' ', T.fg('text', title), ' ',
+        T.fg(statusRole(status), status), T.fg('warning', arch),
+      ].join('');
     }
-    const titleMax = Math.max(10, Math.min(38, W - 36));
-    const title = trunc(r.title ?? '(untitled)', titleMax);
-    const st = r.status === 'started' ? this.colored(r.status ?? '?', 'active') : (r.status ?? '?');
-    let s = `${marker}${String(n).padStart(3)}  ${title}${kind}${ws}  ${st}${arch}  ${age}`;
-    return s.length > W ? s.slice(0, W) : s;
+    const titleW = Math.max(10, Math.min(38, W - 14 - dispWidth(kind) - dispWidth(ws) - dispWidth(status) - dispWidth(arch) - dispWidth(age)));
+    const title = truncW(r.title ?? '(untitled)', titleW);
+    const plain = `${sel ? g.arrow : ' '}${num}  ${title}${kind}${ws}  ${status}${arch}  ${age}`;
+    if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
+    return [
+      T.fg('dim', num), '  ',
+      T.fg('text', title), T.fg('muted', kind), T.fg('dim', ws), '  ',
+      T.fg(statusRole(status), status), T.fg('warning', arch), '  ',
+      T.fg('dim', age),
+    ].join('');
+  }
+
+  renderSearch(W, line) {
+    const T = this.theme;
+    const g = this.glyphs;
+    const { rows, total, q } = this.searchResults;
+    const prompt = T.style({ bold: true, fg: 'brand' }, ' search title: ')
+      + T.style({ fg: 'text', bg: 'selectedBg' }, padTo(this.searchBuf, Math.max(6, W - 14)) + g.cursor);
+    const out = [prompt, T.fg('border', line)];
+    if (!rows.length) out.push(T.fg('muted', `(no sessions match "${q}")`));
+    for (let i = 0; i < rows.length; i++) out.push(this.formatRow(rows[i], i + 1, W, false));
+    out.push(T.fg('border', line));
+    out.push(` ${T.style({ bold: true, fg: 'signal' }, `${total}`)} ${T.fg('muted', 'match(es)')}`
+      + T.fg('dim', '   enter apply   esc cancel'));
+    return out;
   }
 
   renderMenu(W, line) {
     const s = this.selected;
+    const T = this.theme;
     const x = s ? this.discovery.getSession(s.session_id) : null;
-    if (!x) return ['(session gone — press q)'];
+    if (!x) return [T.fg('muted', '(session gone — press q)')];
     const rows = [
-      ` session: ${trunc(x.title ?? '(untitled)', Math.max(10, W - 12))}`,
-      ` id: ${x.session_id}`,
-      ` status: ${x.status}${x.archived ? ' (archived)' : ''}   kind: ${x.session_kind}   ws: ${shortWs(x.workspace_dir ?? '')}`,
-      line,
+      ' ' + T.style({ bold: true, fg: 'brand' }, `session: ${trunc(x.title ?? '(untitled)', Math.max(10, W - 12))}`),
+      ` ${T.fg('muted', 'id:')} ${T.fg('dim', x.session_id)}`,
+      ` ${T.fg('muted', 'status:')} ${T.fg(statusRole(x.status), x.status)}${x.archived ? T.fg('warning', ' (archived)') : ''}`
+      + `   ${T.fg('muted', 'kind:')} ${x.session_kind}   ${T.fg('muted', 'ws:')} ${T.fg('dim', shortWs(x.workspace_dir ?? ''))}`,
+      T.fg('border', line),
     ];
     for (let i = 0; i < ACTION_MENU.length; i++) {
       const [key, label] = ACTION_MENU[i];
       const hl = i === this._menuIdx;
       const dangerous = key === '6';
-      rows.push(`${hl ? this.glyphs.arrow + ' ' : '  '}${key}  ${dangerous ? this.colored(label, 'danger') : label}`);
+      const plain = `${hl ? this.glyphs.arrow : ' '}${key}  ${label}`;
+      if (hl) rows.push(T.style({ bg: 'selectedBg', fg: dangerous ? 'error' : 'signal', bold: true }, padTo(plain, W)));
+      else rows.push(` ${T.fg('dim', key)}  ${dangerous ? T.fg('error', label) : T.fg('text', label)}`);
     }
-    rows.push(line);
-    rows.push('esc/q/backspace back   type the number or press enter');
+    rows.push(T.fg('border', line));
+    rows.push(T.fg('dim', ' esc/q/backspace back   type the number or press enter'));
     if (this.message) rows.push(this.colored(this.message, this.messageKind));
     this.message = '';
     return rows;
   }
 
   renderConfirm(W, line) {
+    const T = this.theme;
     const s = this.deleteTarget, p = this.deletePlan;
     const showRows = Math.max(4, this.height - 16);
     const rows = [
-      this.colored(' DELETE — destructive', 'danger'),
-      ` session: ${trunc(s.title ?? s.session_id, Math.max(10, W - 12))}`,
-      ` id: ${s.session_id}`,
-      ` backup: ${this.flags.noBackup ? 'DISABLED (--no-backup)' : 'automatic (path shown after)'}`,
-      line,
-      ` tables affected: ${p.affecting.length}   rows: ${p.rows}`,
+      T.style({ bold: true, fg: 'error' }, ' DELETE — destructive'),
+      ` ${T.fg('muted', 'session:')} ${T.fg('text', trunc(s.title ?? s.session_id, Math.max(10, W - 12)))}`,
+      ` ${T.fg('muted', 'id:')} ${T.fg('dim', s.session_id)}`,
+      ` ${T.fg('muted', 'backup:')} ${this.flags.noBackup ? T.fg('error', 'DISABLED (--no-backup)') : T.fg('success', 'automatic (path shown after)')}`,
+      T.fg('border', line),
+      ` ${T.fg('muted', 'tables affected:')} ${T.fg('text', String(p.affecting.length))}   ${T.fg('muted', 'rows:')} ${T.fg('text', String(p.rows))}`,
     ];
-    for (const e of p.affecting.slice(0, showRows)) rows.push(`   ${String(e.count).padStart(6)}  ${e.table}`);
-    if (p.affecting.length > showRows) rows.push(`   ... +${p.affecting.length - showRows} more table(s)`);
-    for (const w of p.warnings) rows.push(`   warn: ${w}`);
-    rows.push(line);
-    rows.push(this.colored(` type the last 8 chars of the id to confirm: [${this.confirmToken}]`, 'danger'));
-    rows.push(` > ${this.inputBuf}`);
-    rows.push(' esc/q cancels without any change');
+    for (const e of p.affecting.slice(0, showRows)) rows.push(`   ${T.fg('warning', String(e.count).padStart(6))}  ${T.fg('dim', e.table)}`);
+    if (p.affecting.length > showRows) rows.push(`   ${T.fg('muted', `... +${p.affecting.length - showRows} more table(s)`)}`);
+    for (const w of p.warnings) rows.push(`   ${T.fg('warning', 'warn: ' + w)}`);
+    rows.push(T.fg('border', line));
+    rows.push(T.style({ bold: true, fg: 'error' }, ` type the last 8 chars of the id to confirm: [${this.confirmToken}]`));
+    rows.push(` > ${this.inputBuf}${this.glyphs.cursor}`);
+    rows.push(T.fg('dim', ' esc/q cancels without any change'));
     return rows;
   }
 
   renderInput(W, line) {
+    const T = this.theme;
     return [
-      ` ${this.inputPrompt}`,
-      line,
-      ` > ${this.inputBuf}`,
-      line,
-      ' enter confirms   esc cancels',
+      ' ' + T.style({ bold: true, fg: 'brand' }, this.inputPrompt),
+      T.fg('border', line),
+      ` > ${T.style({ bg: 'selectedBg' }, this.inputBuf + this.glyphs.cursor)}`,
+      T.fg('border', line),
+      T.fg('dim', ' enter confirms   esc cancels'),
     ];
   }
 
   renderFilter(W, line) {
-    const rows = [` filter: ${this.filterKind}`, line];
+    const T = this.theme;
+    const rows = [' ' + T.style({ bold: true, fg: 'brand' }, `filter: ${this.filterKind}`), T.fg('border', line)];
     const max = Math.min(this.foptions.length, this.height - 6);
     for (let i = 0; i < max; i++) {
       const o = this.foptions[i];
-      rows.push(`${(this.fcursor === i ? this.glyphs.arrow : ' ')}${i + 1}  ${trunc(o.label, Math.max(8, W - 8))}`);
+      const hl = this.fcursor === i;
+      const label = trunc(o.label, Math.max(8, W - 8));
+      const plain = `${hl ? this.glyphs.arrow : ' '}${i + 1}  ${label}`;
+      if (hl) rows.push(T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W)));
+      else rows.push(` ${T.fg('dim', String(i + 1))}  ${T.fg('text', label)}`);
     }
-    rows.push(line);
-    rows.push(' j/k or number   enter selects   esc/x clears');
+    rows.push(T.fg('border', line));
+    rows.push(T.fg('dim', ' j/k or number   enter selects   esc/x clears'));
     return rows;
   }
 
   renderOutput(W, line) {
+    const T = this.theme;
     const L = this.outputText.split('\n');
     const max = Math.max(3, this.height - 5);
-    const shown = L.slice(0, max);
+    const start = Math.min(Math.max(0, this._outputScroll), Math.max(0, L.length - max));
+    const shown = L.slice(start, start + max);
+    const more = L.length - max;
     return [
-      ` ${this.outputTitle}${L.length > max ? `  (${L.length - max} more lines)` : ''}`,
-      line,
+      ' ' + T.style({ bold: true, fg: 'brand' }, this.outputTitle)
+        + (more > 0 ? T.fg('dim', `  (${more} more line${more === 1 ? '' : 's'}, j/k scroll)`) : ''),
+      T.fg('border', line),
       ...shown.map(l => trunc(l, W)),
-      line,
-      ' press any key to go back',
+      T.fg('border', line),
+      T.fg('dim', ' j/k scroll   any other key goes back'),
     ];
   }
 
   // -------------------------------------------------------------- utils
+  // message kinds map onto mcode's semantic colours
   colored(text, kind) {
-    if (!this.color) return text;
-    const C = { danger: '\x1b[31m', warn: '\x1b[33m', ok: '\x1b[32m', active: '\x1b[36m' };
-    return (C[kind] || '') + text + '\x1b[0m';
+    const role = kind === 'danger' ? 'error' : kind === 'warn' ? 'warning' : kind === 'ok' ? 'success' : 'signal';
+    return this.theme.style({ bold: kind !== 'info', fg: role }, text);
   }
 }
 
 // ----------------------------------------------------------------- utils
 export function trunc(s, n) { s = String(s ?? ''); return s.length > n ? s.slice(0, Math.max(0, n - 1)) + '…' : s; }
+// truncate to a *display width* (titles may contain wide characters)
+function truncW(s, n) {
+  s = String(s ?? '');
+  if (dispWidth(s) <= n) return s;
+  let out = '';
+  for (const ch of s) {
+    if (dispWidth(out + ch) > n - 1) break;
+    out += ch;
+  }
+  return out + '…';
+}
 function shortWs(w) { if (!w) return ''; const p = String(w).split('/'); return p[p.length - 1] || w; }
 function relAge(ms) {
   if (ms == null) return '';

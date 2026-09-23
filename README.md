@@ -33,20 +33,29 @@ mcode-sessions
 
 ## Interactive TUI (default)
 
-A compact, keyboard-only browser for a narrow phone terminal:
+A compact, keyboard-only browser for a narrow phone terminal, themed to match
+mcode itself (see [Theming](#theming) below):
 
 ```
- mcode sessions  n=23  archived=1  locked=1
+ mcode sessions  n=23  archived=1  locked=1  ↓
 ──────────────────────────────────────────────────────────────
 ›  1  1 - Ask about available tools…  idle  2h
    2  debugging mcode                 idle  3h
    3  (untitled)                      started  3h
    ...
 ──────────────────────────────────────────────────────────────
-page 1/2  arch-in
+ 1/23  arch-in
 j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r refresh  q quit
 ```
 
+- renders into the alternate screen buffer and repaints in place, so the header
+  never stacks up as you move around, and it refits live on terminal resize
+- **windowed scrolling**: only one screen-full of rows is fetched at a time;
+  the next/previous window loads as the cursor reaches the edge
+- the footer always shows `x/y` — the cursor's position over the total — and
+  pushing past either end wraps to the other side (so you never get lost)
+- **live search**: `/` opens a prompt that filters the list on every keystroke;
+  `enter` applies, `esc` cancels
 - degrades gracefully: below ~46 columns it shows only `number + title + status`
 - `--ascii` replaces box-drawing characters with plain ASCII
 - handles terminal resize and Ctrl-C cleanly; no mouse required
@@ -146,12 +155,49 @@ src/discovery.js          session discovery: list/filter/count/messages/usage
 src/safety.js             active detection, dry-run plan builder, backup
 src/lifecycle.js          rename / archive / fork / delete (native-first)
 src/inspect.js            inspect / stats / export
+src/theme.js              mcode `minimax` theme palette + colour degradation
 src/tui.js                keyboard-only terminal UI
 src/cli.js                CLI command surface
 tests/mutations.test.mjs  48 mutation checks against disposable sessions
 tests/tui.test.mjs        32 TUI state-machine checks
 RESEARCH.md               reverse-engineering report for every operation
 ```
+
+## Theming
+
+The TUI reuses **mcode's own `minimax` theme** rather than inventing colours.
+The palette was lifted verbatim out of the installed 0.5.2 bundle
+(`chunks/launcher-BKHZAKO7.js`, the `qi("minimax", …)` colour maps), so the
+session manager matches the agent it manages:
+
+| Role in this tool        | mcode role     | Colour (dark)  |
+|---|---|---|
+| header / brand           | `brand`        | `#68C0FF`      |
+| selected row, position   | `signal`       | `#68C0FF`      |
+| `started` sessions       | `signal`       | `#68C0FF`      |
+| `archived` marker        | `warning`      | `#FFC340`      |
+| `aborted` sessions       | `warning`      | `#FFC340`      |
+| delete / destructive     | `error`        | `#FF5E6C`      |
+| success / verified       | `success`      | `#28C567`      |
+| row text                 | `text`         | `#D6D6D6`      |
+| counts, secondary        | `muted`        | `#ADADAD`      |
+| hints, ages              | `dim`          | `#666666`      |
+| separators               | `border`       | `#303030`      |
+| selected-row background  | `userMessageBg`| `#262626`      |
+
+Behaviour details, all matching how mcode itself behaves:
+
+- reads the active theme name from mcode's own settings file
+  (`~/.minimax/tui/tui-settings.json`, currently `minimax`), so if you switch
+  mcode's theme the tool follows
+- light/dark is resolved the way mcode resolves it: from `COLORFGBG` luminance,
+  defaulting to dark. Override with `MSM_THEME=light` / `MSM_THEME=dark`
+- colour depth follows the terminal's reported capability, down the same ladder
+  mcode uses: truecolor → 256-colour (hex converted via the standard
+  rgb→ansi256 function) → 16-colour (mcode's named fallback table) → none
+- `--no-color` (or `NO_COLOR`) emits **no** SGR colour codes at all — only
+  structural screen-control escapes
+- `--ascii` swaps the box-drawing glyphs for plain ASCII independently of colour
 
 ## Tests
 
