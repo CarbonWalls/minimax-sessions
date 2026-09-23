@@ -60,7 +60,7 @@ env overrides:
   MSM_HOME               this tool's state dir
   MSM_MCODE_ROOT         mcode install root
   MSM_MCODE_RELEASE      pin a release (else newest is auto-found)
-  MSM_BACKUP_KEEP        backups to keep (default 20)
+  MSM_BACKUP_KEEP        backups to keep (default 5)
   MSM_THEME              light|dark override
   MSM_THEME_NAME         theme name override
 `;

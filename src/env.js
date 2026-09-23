@@ -37,7 +37,7 @@ export const DB_PATH = path.join(RUNTIME_DATA_DIR, 'v2', 'sqlite', 'runtime-stat
 export const MSM_DIR = process.env.MSM_HOME || path.join(homedir(), '.mcode-session-manager');
 export const MSM_LOG_DIR = path.join(MSM_DIR, 'logs');
 export const MSM_BACKUP_DIR = path.join(MSM_DIR, 'backups');
-export const MSM_BACKUP_KEEP = envInt('MSM_BACKUP_KEEP', 20);
+export const MSM_BACKUP_KEEP = envInt('MSM_BACKUP_KEEP', 5);
 
 export const SESSION_ID_PREFIX = 'mvs_';
 

@@ -149,7 +149,7 @@ is not listening). Those therefore use the conservative SQLite fallback — see
   ever targets `WHERE <session key> = <exact id>`
 - a database backup is written before the first real destructive operation
   (unless `--no-backup`), and its path is printed; old backups are pruned to
-  the newest `MSM_BACKUP_KEEP` (default 20)
+  the newest `MSM_BACKUP_KEEP` (default 5)
 - deletes run in one transaction; a row-count mismatch aborts and rolls back
 - after deleting, every planned table is re-counted; cascade children are
   verified by the concrete ids captured *before* the parent row disappeared
