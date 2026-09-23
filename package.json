@@ -1,0 +1,16 @@
+{
+  "name": "mcode-session-manager",
+  "version": "1.0.0",
+  "description": "Standalone local session manager for MiniMax Code (inspect, browse, rename, archive, fork, delete, export, stats).",
+  "type": "module",
+  "bin": {
+    "mcode-sessions": "./bin/mcode-sessions"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node ./bin/mcode-sessions"
+  },
+  "license": "MIT"
+}
