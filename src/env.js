@@ -23,10 +23,27 @@ function discoverRelease() {
 }
 
 export const MCODE_RELEASE = process.env.MSM_MCODE_RELEASE || discoverRelease();
-export const MCODE_PKG = path.join(
-  MCODE_INSTALL_ROOT, 'releases', MCODE_RELEASE,
-  'lib', 'node_modules', '@minimax-ai', 'code'
-);
+// npm global layout (`mcode update` / `npm i -g`); may be newer than releases/.
+const MCODE_NPM_PKG = path.join(MCODE_INSTALL_ROOT, 'lib', 'node_modules', '@minimax-ai', 'code');
+export const MCODE_PKG = (() => {
+  // Prefer whichever package.json reports a higher version so sqlite/ACP
+  // helpers track the binary the user actually runs after `mcode update`.
+  const ver = dir => {
+    try { return JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8')).version; }
+    catch { return null; }
+  };
+  const a = ver(path.join(MCODE_INSTALL_ROOT, 'releases', MCODE_RELEASE, 'lib', 'node_modules', '@minimax-ai', 'code'));
+  const b = ver(MCODE_NPM_PKG);
+  const cmp = (x, y) => {
+    if (!x) return y ? 1 : 0;
+    if (!y) return -1;
+    const pa = x.split('.').map(Number), pb = y.split('.').map(Number);
+    for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+    return 0;
+  };
+  if (cmp(b, a) > 0) return MCODE_NPM_PKG;
+  return path.join(MCODE_INSTALL_ROOT, 'releases', MCODE_RELEASE, 'lib', 'node_modules', '@minimax-ai', 'code');
+})();
 export const MCODE_CLI_JS = path.join(MCODE_PKG, 'cli.js'); // used to require better-sqlite3
 export const MCODE_BIN = path.join(MCODE_INSTALL_ROOT, 'bin', 'mcode');
 

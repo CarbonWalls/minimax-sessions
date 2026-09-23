@@ -10,7 +10,7 @@ import { Safety } from './safety.js';
 import { trunc, shortWs, relAge, iso, wrapText, clipTo, fitLR, dispWidth } from './format.js';
 import {
   DB_PATH, MSM_DIR, MSM_LOG_DIR, MSM_BACKUP_DIR, dbExists, mcodeBinExists,
-  mcodeVersion, MCODE_BIN, MCODE_INSTALL_ROOT, MCODE_PKG, MCODE_RELEASE,
+  mcodeVersion, MCODE_BIN, MCODE_INSTALL_ROOT, MCODE_PKG,
   SESSION_ID_PREFIX, parseFlags,
 } from './env.js';
 
@@ -75,7 +75,7 @@ export async function runCli(argv) {
     if (!flags.json) process.stdout.write(wrapText(HELP, termWidth()) + '\n');
     return 0;
   }
-  if (flags.version) { print(`mcode-sessions ${VERSION} (mcode ${mcodeVersion()}, release ${MCODE_RELEASE})`, flags); return 0; }
+  if (flags.version) { print(`mcode-sessions ${VERSION} (mcode ${mcodeVersion()})`, flags); return 0; }
 
   const cmd = positional[0] ?? '';
   if (!cmd) {
@@ -411,7 +411,7 @@ async function cmdDoctor(flags, log) {
   add('node >= 20', major >= 20, `v${process.versions.node}`);
 
   add('mcode install root', existsSync(MCODE_INSTALL_ROOT), MCODE_INSTALL_ROOT);
-  add(`mcode release ${MCODE_RELEASE}`, existsSync(MCODE_PKG), MCODE_PKG);
+  add(`mcode package ${mcodeVersion()}`, existsSync(MCODE_PKG), MCODE_PKG);
   add('mcode binary', mcodeBinExists(), MCODE_BIN);
   add('mcode version readable', !!mcodeVersion(), mcodeVersion());
 
@@ -476,7 +476,7 @@ async function cmdDoctor(flags, log) {
     process.stdout.write(JSON.stringify({ ok: failed.length === 0, checks }, null, 2) + '\n');
     return failed.length ? 1 : 0;
   }
-  print(`mcode-sessions doctor  (mcode ${mcodeVersion()}, release ${MCODE_RELEASE})`, flags);
+  print(`mcode-sessions doctor  (mcode ${mcodeVersion()})`, flags);
   print('', flags);
   for (const c of checks) {
     const mark = c.ok ? '  ok ' : ' FAIL';
