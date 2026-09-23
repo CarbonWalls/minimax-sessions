@@ -5,7 +5,7 @@ A standalone, dependency-free terminal tool for inspecting and managing
 interface: browse, search, filter, inspect, rename, archive, fork, export, and
 delete the sessions stored in the MiniMax runtime database.
 
-Built and verified against **MiniMax Code 0.5.2** on linux/arm64
+Built and verified against **MiniMax Code 0.5.3** on linux/arm64
 (termux/proot). The reverse-engineering behind every operation is documented in
 **[RESEARCH.md](./RESEARCH.md)** — read that first if you want to know *why*
 each operation is implemented the way it is.
@@ -13,10 +13,13 @@ each operation is implemented the way it is.
 ## Requirements
 
 - `node` (>= 20; tested on v26)
-- the MiniMax Code installation at `/root/.minimax-code/releases/<newest>/…`
-  (auto-discovered; pin with `MSM_MCODE_RELEASE` / override root with
-  `MSM_MCODE_ROOT`. Only used to load its already-installed `better-sqlite3`
-  binding and to run `mcode acp` — nothing in the install is ever modified)
+- the MiniMax Code installation under `/root/.minimax-code` — either the
+  npm-global package at `lib/node_modules/@minimax-ai/code` (`mcode update` /
+  `npm i -g`) or a release tree at `releases/<newest>/…`; whichever package.json
+  reports the higher version is used (pin with `MSM_MCODE_RELEASE` / override
+  root with `MSM_MCODE_ROOT`). Only used to load its already-installed
+  `better-sqlite3` binding and to run `mcode acp` — nothing in the install is
+  ever modified
 - the runtime database at `/root/.minimax/v2/sqlite/runtime-state.sqlite`
 
 Both locations can be overridden with `MSM_RUNTIME_DATA_DIR` / `MSM_HOME`.
@@ -183,9 +186,10 @@ RESEARCH.md               reverse-engineering report for every operation
 ## Theming
 
 The TUI reuses **mcode's own `minimax` theme** rather than inventing colours.
-The palette was lifted verbatim out of the installed 0.5.2 bundle
-(`chunks/launcher-BKHZAKO7.js`, the `qi("minimax", …)` colour maps), so the
-session manager matches the agent it manages:
+The palette was lifted verbatim out of the installed mcode bundle
+(`chunks/launcher-*.js`, the `minimax` dark/light colour maps — identical in
+0.5.2 and 0.5.3; only the chunk hash renamed), so the session manager matches
+the agent it manages:
 
 | Role in this tool        | mcode role     | Colour (dark)  |
 |---|---|---|
