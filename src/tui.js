@@ -642,17 +642,30 @@ export class Tui {
     return rows;
   }
 
-  // shared bottom hint; shrinks with width and prepends any one-shot message
+  // shared bottom hint; each tier's string is <= that tier's max width so
+  // clipTo never has to cut a word. `msg` (when present) is prepended and the
+  // combined result is still hard-clipped to W.
   _hintLine(W) {
     const T = this.theme;
     const W2 = W;
-    let hint;
-    if (W2 < 40) hint = 'j/k  enter  /  q';
-    else if (W2 < 56) hint = 'j/k move  enter  /  x clear  q';
-    else if (W2 < 72) hint = 'j/k move  enter  /  n/b page  x clear  q quit';
-    else if (W2 < 100) hint = 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  q quit';
-    else hint = 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r refresh  q quit';
+    // tiers: pick the longest hint whose length still fits W (minus room for
+    // a one-shot message when one is pending)
     const msg = this.message ? this.colored(this.message, this.messageKind) + '  ' : '';
+    const room = Math.max(8, W2 - (msg ? dispWidth(msg) : 0));
+    const tiers = [
+      [16, 'j/k  enter  /  q'],
+      [30, 'j/k move  enter  /  x clear  q'],
+      [45, 'j/k move  enter  /  n/b page  x clear  q quit'],
+      [53, 'j/k move  enter  /  n/b page  a arch  x clear  q'],
+      [68, 'j/k move  enter actions  / search  n/b page  a arch  x clear  q quit'],
+      [74, 'j/k move  enter  / search  n/b page  a arch  s/t/w filter  x clear  q quit'],
+      [82, 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  q quit'],
+      [93, 'j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r refresh  q quit'],
+    ];
+    let hint = tiers[0][1];
+    for (const [len, h] of tiers) {
+      if (len <= room) hint = h;
+    }
     return clipTo(msg + T.fg('dim', hint), W2);
   }
 
