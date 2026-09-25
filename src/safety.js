@@ -115,7 +115,7 @@ export class Safety {
         const pcols = this.db.columns(parent).filter(isSessionKeyCol);
         const pwhere = pcols.map(pc => `${quoteIdent(pc)} = ?`).join(' OR ');
         entries.push({
-          table: t, kind: 'cascade', idCol: c,
+          table: t, kind: 'cascade', idCol: c, parentTable: parent,
           where: `${quoteIdent(c)} IN (SELECT ${quoteIdent(c)} FROM ${quoteIdent(parent)} WHERE ${pwhere})`,
           params: pcols.map(() => sessionId),
           count: null,
@@ -132,9 +132,53 @@ export class Safety {
     // fill counts
     for (const e of entries) e.count = this.db.rowCount(e.table, e.where, e.params);
 
-    // children first, primary row last; keep a stable order otherwise
-    entries.sort((a, b) => (a.kind === 'primary' ? 1 : 0) - (b.kind === 'primary' ? 1 : 0));
-    return { entries, warnings };
+    // Order must respect the cascade dependencies: a cascade child's WHERE
+    // selects ids FROM its parent table, so the child has to be deleted BEFORE
+    // that parent or the subquery matches nothing (row-count mismatch -> the
+    // whole transaction rolls back and nothing is removed). Ordering by kind
+    // alone — every session-key table, then every cascade child — inverts this
+    // whenever a parent is itself session-keyed, which silently broke deletion
+    // for any session that had recorded turn ingress rows.
+    const ordered = this._orderPlan(entries);
+    return { entries: ordered, warnings };
+  }
+
+  // Topologically order a deletion plan. Each cascade child is emitted before
+  // the parent table its WHERE references; the primary row stays last; the
+  // relative order of independent entries is preserved. If a cycle is somehow
+  // present the remainder is appended in input order rather than dropped, so a
+  // plan can never silently lose entries.
+  _orderPlan(entries) {
+    // a parent table may not be deleted until every cascade child pointing at it
+    // has already gone (otherwise that child's subquery would find nothing)
+    const blockers = new Map();
+    for (const e of entries) {
+      if (e.kind !== 'cascade' || !e.parentTable) continue;
+      if (!blockers.has(e.parentTable)) blockers.set(e.parentTable, new Set());
+      blockers.get(e.parentTable).add(e.table);
+    }
+    const primary = [];
+    const rest = [];
+    for (const e of entries) (e.kind === 'primary' ? primary : rest).push(e);
+
+    const ordered = [];
+    const emitted = new Set();
+    let pending = rest;
+    while (pending.length) {
+      const stuck = [];
+      let progressed = false;
+      for (const e of pending) {
+        const need = blockers.get(e.table);
+        if (need && [...need].some(t => !emitted.has(t))) { stuck.push(e); continue; }
+        ordered.push(e);
+        emitted.add(e.table);
+        progressed = true;
+      }
+      if (!progressed) { ordered.push(...pending); break; } // cycle: keep everything
+      pending = stuck;
+    }
+    ordered.push(...primary);
+    return ordered;
   }
 
   // Online backup via SQLite's backup API. Never touches the live DB.

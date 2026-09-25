@@ -6,13 +6,17 @@
 // theme palette (see theme.js), degrading through truecolor -> 256 -> 16 ->
 // plain. `--no-color` emits no SGR at all; `--ascii` uses plain-ASCII glyphs.
 //
-// Scrolling: windowed. Only one screen-full of rows is fetched at a time and
-// the next/previous window loads as the cursor reaches the edge; the footer
-// always shows x(current)/y(total), and pushing past either end wraps around.
+// Scrolling: infinite. Rows accumulate as the cursor nears the end of the
+// loaded data and new pages are appended onto the tail (never cleared), while
+// the viewport slides one row at a time — so scrolling is smooth, page-free and
+// duplicate-free. The cursor rides the MIDDLE of the page, so rows below it stay
+// visible and the end of the list comes into view a half-page before you reach
+// it. Position shows x(current)/y(total); pushing past either end wraps around.
 import { spawn } from 'node:child_process';
 import { Discovery } from './discovery.js';
 import { Lifecycle } from './lifecycle.js';
 import { Inspector } from './inspect.js';
+import { Repairer } from './repair.js';
 import { SqliteAdapter } from './sqlite.js';
 import { MCODE_BIN, dbExists, mcodeBinExists } from './env.js';
 import { Theme, dispWidth, padTo, clipTo } from './theme.js';
@@ -192,40 +196,92 @@ export class Tui {
     if (k.char === '0') { if (9 < n) return this.openMenu(this.rows[9]); }
   }
 
-  // windowed scrolling ------------------------------------------------
-  // Only `pageSize` rows are held at once. Reaching the edge loads the next or
-  // previous window; pushing past the last/first row wraps to the other end.
+  // Infinite scrolling ------------------------------------------------
+  // Rows ACCUMULATE as the cursor approaches the end of the loaded data, like
+  // infinite-scroll pagination: previously loaded items are never cleared, new
+  // pages are appended onto the tail, and the viewport advances one row at a
+  // time — so there are no page jumps, duplicates, or flicker. The cursor is an
+  // absolute index into the full filtered set (not an index within a window).
+  // The viewport keeps the cursor near the CENTRE of the page once it starts
+  // moving, instead of pinning it to the bottom row (see _followCursor).
+  get hasMore() { return this.rows.length < this.total; }
+
+  // Append one batch from the DB at the current load tail, deduped by session id
+  // so a dataset that shifts mid-scroll can never produce duplicate rows.
+  // `force` seeds the first batch from refresh(): hasMore() compares loaded rows
+  // against this.total, which is 0 until the first query lands, so the seed must
+  // not be gated on it (an empty dataset still loads zero rows and then stops).
+  loadMore(force = false) {
+    if (!force && !this.hasMore) return;
+    const batch = Math.max(this.pageSize, 100);
+    const offset = this.rows.length;
+    const { rows, total } = this.discovery.list({ limit: batch, offset, filters: this.filters });
+    this.total = total;
+    const known = new Set(this.rows.map(r => r.session_id));
+    for (const r of rows) if (!known.has(r.session_id)) { this.rows.push(r); known.add(r.session_id); }
+    this.log?.verbose(`loadMore offset=${offset} +${rows.length} -> loaded=${this.rows.length} total=${total}`);
+  }
+
+  // Make sure rows are loaded at least up to global index `upTo` (inclusive).
+  // A no-op once enough data is already in memory, so ordinary scrolling costs
+  // nothing; a query is only issued as the cursor nears the load tail.
+  ensureLoaded(upTo) {
+    while (this.rows.length <= upTo && this.hasMore) this.loadMore();
+  }
+
+  // Centre-anchored viewport. Once the cursor passes the middle of the page the
+  // viewport slides to keep it there, so whatever sits BELOW the cursor stays
+  // visible: you can see the end of the list approaching a half-page before you
+  // actually reach it, rather than having it appear at the last moment. Both
+  // ends clamp — near the top/bottom the page stops scrolling and the cursor
+  // walks to the edge, so the first and last rows are always fully on screen.
+  _followCursor() {
+    const mid = Math.floor(this.pageSize / 2);
+    const maxOffset = Math.max(0, this.total - this.pageSize);
+    this.offset = Math.max(0, Math.min(this.cursor - mid, maxOffset));
+  }
+
   moveDown() {
-    const n = this.rows.length;
-    if (n === 0) return;
-    if (this.cursor < n - 1) { this.cursor++; return this.render(); }
-    if (this.offset + n < this.total) { this.offset += n; this.refresh(); this.cursor = 0; return this.render(); }
-    return this.goTop(); // past the end -> wrap to the top
+    if (this.total === 0) return;
+    this.ensureLoaded(this.cursor + this.pageSize); // keep a page of runway loaded
+    if (this.cursor < this.total - 1) {
+      this.cursor++;
+    } else {
+      return this.goTop(); // past the end -> wrap to the top
+    }
+    this._followCursor();
+    return this.render();
   }
   moveUp() {
-    const n = this.rows.length;
-    if (n === 0) return;
-    if (this.cursor > 0) { this.cursor--; return this.render(); }
-    if (this.offset > 0) { this.offset = Math.max(0, this.offset - this.pageSize); this.refresh(); this.cursor = this.rows.length - 1; return this.render(); }
-    return this.goBottom(); // above the top -> wrap to the bottom
+    if (this.total === 0) return;
+    if (this.cursor > 0) {
+      this.cursor--;
+    } else {
+      return this.goBottom(); // above the top -> wrap to the bottom
+    }
+    this._followCursor();
+    return this.render();
   }
-  goTop() { this.offset = 0; this.refresh(); this.cursor = 0; this.render(); }
+  goTop() { this.offset = 0; this.cursor = 0; this.render(); }
   goBottom() {
-    const ps = this.pageSize;
-    this.offset = Math.max(0, (Math.ceil(this.total / ps) - 1) * ps);
-    this.refresh();
-    this.cursor = Math.max(0, this.rows.length - 1);
+    this.ensureLoaded(this.total - 1);
+    this.cursor = Math.max(0, this.total - 1);
+    this.offset = Math.max(0, this.total - this.pageSize);
     this.render();
   }
   nextPage() {
-    const ps = this.pageSize;
-    if (this.offset + this.rows.length < this.total) { this.offset = Math.min(this.offset + ps, Math.max(0, this.total - 1)); this.refresh(); this.cursor = 0; }
-    else this.goTop();
+    if (this.total === 0) return;
+    if (this.cursor >= this.total - 1) return this.goTop();
+    this.ensureLoaded(this.cursor + this.pageSize);
+    this.cursor = Math.min(this.total - 1, this.cursor + this.pageSize);
+    this._followCursor();
     this.render();
   }
   prevPage() {
-    if (this.offset > 0) { this.offset = Math.max(0, this.offset - this.pageSize); this.refresh(); this.cursor = 0; }
-    else this.goBottom();
+    if (this.total === 0) return;
+    if (this.cursor <= 0) return this.goBottom();
+    this.cursor = Math.max(0, this.cursor - this.pageSize);
+    this._followCursor();
     this.render();
   }
 
@@ -363,15 +419,24 @@ export class Tui {
 
   // -------------------------------------------------------------- actions
   refresh() {
-    const { rows, total } = this.discovery.list({ limit: this.pageSize, offset: this.offset, filters: this.filters });
-    this.rows = rows;
-    this.total = total;
-    if (rows.length === 0 && this.offset > 0) { this.offset = 0; }
-    if (this.cursor >= rows.length) this.cursor = Math.max(0, rows.length - 1);
+    // Full reload from the top, then restore a valid position. Accumulation is
+    // re-seeded so a filter change / mutation / manual refresh sees fresh data
+    // while ordinary scrolling never clears the loaded list.
+    const keepCursor = this.cursor;
+    this.rows = [];
+    this.offset = 0;
+    this.cursor = 0;
+    this.total = 0;
+    this.loadMore(true); // seeds total + first batch (bypasses the hasMore gate)
+    this.ensureLoaded(keepCursor);
+    if (this.total > 0) {
+      this.cursor = Math.min(keepCursor, this.total - 1);
+      this._followCursor();
+    }
     // facet counts are two COUNT(*) queries — refresh them with the data, not
     // on every keystroke repaint
     try { this._facets = this.discovery.facetCounts(); } catch { /* keep last */ }
-    this.log?.verbose(`refresh offset=${this.offset} rows=${rows.length} total=${total} filters=${JSON.stringify(this.filters)}`);
+    this.log?.verbose(`refresh loaded=${this.rows.length} total=${this.total} cursor=${this.cursor} filters=${JSON.stringify(this.filters)}`);
   }
 
   openMenu(row) {
@@ -422,6 +487,9 @@ export class Tui {
   showInspect(s) {
     const d = this.inspector.inspect(s.session_id);
     const x = d.session;
+    let issues = [];
+    try { issues = new Repairer({ log: this.log, db: this.db }).detect(s.session_id).issues; }
+    catch (e) { this.log?.debug?.('issue detection skipped: ' + e.message); }
     this.outputTitle = 'inspect';
     this.outputText = [
       `session: ${x.title ?? '(untitled)'}`,
@@ -434,6 +502,7 @@ export class Tui {
       `messages: ${d.messageCount}   token rows: ${d.tokenUsage?.rows ?? 0}`,
       ...d.locks.map(l => `lock: ${l.owner_kind} acquired ${iso(l.acquired_at_ms)} expires ${iso(l.expires_at_ms)}`),
       ...(x.error_message ? [`error: ${x.error_message}`] : []),
+      ...(issues.length ? ['', `${issues.length} issue(s) detected:`, ...issues.map(i => `  [${i.severity}] ${i.table}: ${i.reason}`), `  run \`mcode-sessions repair ${s.session_id}\` to fix`] : []),
     ].join('\n');
     this._outputScroll = 0;
     this.prevScreen = 'menu';
@@ -596,7 +665,7 @@ export class Tui {
 
   // the "current/total" position, plus whether more rows exist off-screen
   positionInfo() {
-    const cur = this.rows.length ? this.offset + this.cursor + 1 : 0;
+    const cur = this.total ? this.cursor + 1 : 0;
     return { cur, total: this.total };
   }
 
@@ -607,7 +676,7 @@ export class Tui {
     const T = this.theme;
     const { cur, total } = this.positionInfo();
     const moreUp = this.offset > 0;
-    const moreDown = this.offset + this.rows.length < total;
+    const moreDown = this.hasMore;
     const head = clipTo(
       T.style({ bold: true, fg: 'brand' }, ' mcode sessions')
       + '  ' + T.fg('muted', `n=${total}`)
@@ -619,10 +688,10 @@ export class Tui {
     // chrome: head + top rule + content(pageSize) + rule + pos + hint
     const rows = [head, T.fg('border', line)];
     const ps = this.pageSize;
-    const start = this.offset + 1;
-    const shown = this.rows.slice(0, ps);
+    const start = this.offset + 1;                       // 1-based row number
+    const shown = this.rows.slice(this.offset, this.offset + ps);
     if (!shown.length) rows.push(T.fg('muted', clipTo('(no match — / search, x clear)', W)));
-    for (let i = 0; i < shown.length; i++) rows.push(this.formatRow(shown[i], start + i, W, i === this.cursor));
+    for (let i = 0; i < shown.length; i++) rows.push(this.formatRow(shown[i], start + i, W, this.offset + i === this.cursor));
     while (rows.length < 2 + ps) rows.push('');
     rows.push(T.fg('border', line));
     const fdesc = [
@@ -669,30 +738,37 @@ export class Tui {
     return clipTo(msg + T.fg('dim', hint), W2);
   }
 
+  // a session is "corrupt/error" if its status is 'error' or it carries an
+  // error message/code — surfaced as a badge so problem sessions stand out.
+  _corrupt(r) { return !!(r && (r.status === 'error' || r.error_message || r.error_code)); }
+
   formatRow(r, n, W, sel) {
     const g = this.glyphs;
     const T = this.theme;
     const status = r.status ?? '?';
     const arch = r.archived ? ' arch' : '';
     const age = relAge(r.updated_at_ms);
+    const errBadge = this._corrupt(r) ? g.warn : '';   // '!' / '⚠'
     const kind = r.session_kind && r.session_kind !== 'conversation' ? ` <${r.session_kind[0]}>` : '';
     const ws = (!r.workspace_dir || r.workspace_dir === '/root') ? '' : ` @${shortWs(r.workspace_dir)}`;
     const num = String(n).padStart(W < 46 ? 2 : 3);
 
     if (W < 46) {
-      const right = `${status}${arch}`;
+      // [badge] status + arch, all right-aligned
+      const right = `${errBadge ? errBadge + ' ' : ''}${status}${arch}`;
       const leftBudget = Math.max(4, W - 1 - dispWidth(num) - 1 - dispWidth(right));
       const title = truncW(r.title ?? '(untitled)', leftBudget);
       const plain = clipTo(`${sel ? g.arrow : ' '}${num} ${title} ${right}`, W);
       if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
       return clipTo([
         T.fg('dim', num), ' ', T.fg('text', title), ' ',
+        ...(errBadge ? [T.fg('error', errBadge), ' '] : []),
         T.fg(statusRole(status), status), T.fg('warning', arch),
       ].join(''), W);
     }
 
-    // right column: status (padded) + optional arch + age — always aligned
-    const rightPlain = `${status.padEnd(7)}${arch} ${age.padStart(4)}`;
+    // right column: [badge] status (padded) + optional arch + age — always aligned
+    const rightPlain = `${errBadge ? errBadge + ' ' : ''}${status.padEnd(7)}${arch} ${age.padStart(4)}`;
     const fixed = 1 + dispWidth(num) + 2 + dispWidth(kind) + dispWidth(ws) + 2 + dispWidth(rightPlain);
     const title = truncW(r.title ?? '(untitled)', Math.max(3, Math.min(40, W - fixed)));
     const leftPlain = `${sel ? g.arrow : ' '}${num}  ${title}${kind}${ws}`;
@@ -709,6 +785,7 @@ export class Tui {
       T.fg('dim', `${sel ? g.arrow : ' '}${num}`) + '  '
       + T.fg('text', title) + T.fg('muted', kind) + T.fg('dim', ws)
       + ' '.repeat(gap)
+      + (errBadge ? T.fg('error', errBadge) + ' ' : '')
       + T.fg(statusRole(status), status.padEnd(7))
       + T.fg('warning', arch) + ' '
       + T.fg('dim', age.padStart(4)),

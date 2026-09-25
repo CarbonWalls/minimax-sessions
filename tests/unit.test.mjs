@@ -187,11 +187,60 @@ ok('pidAlive rejects nonsense', pidAlive('abc') === false);
 ok('pidAlive rejects null', pidAlive(null) === false);
 ok('pidAlive rejects huge missing pid', pidAlive(999999999) === false);
 
+// deletion-plan ordering. A cascade child's WHERE selects ids FROM its parent
+// table, so the child MUST be deleted before that parent; deleting the parent
+// first empties the subquery, the row count no longer matches the plan, and the
+// whole transaction rolls back (the session then cannot be deleted at all).
+// This is a pure function: Safety can be constructed without a DB because
+// _orderPlan never opens one.
+{
+  const { Safety } = await import('../src/safety.js');
+  const s = new Safety({ log: { debug() {}, info() {}, verbose() {} } });
+  const plan = [
+    { table: 'local_runtime_message_rows', kind: 'session_key' },
+    { table: 'local_runtime_turn_ingress', kind: 'session_key' },
+    { table: 'local_runtime_sessions_fts', kind: 'session_key' },
+    { table: 'local_runtime_turn_ingress_sequences', kind: 'cascade', parentTable: 'local_runtime_turn_ingress' },
+    { table: 'local_runtime_v2_memory_execution_tasks', kind: 'cascade', parentTable: 'local_runtime_background_tasks' },
+    { table: 'local_runtime_sessions', kind: 'primary' },
+  ];
+  const idx = t => plan.findIndex(e => e.table === t);
+  const out = s._orderPlan(plan);
+  const pos = t => out.findIndex(e => e.table === t);
+
+  ok('cascade child precedes its parent', pos('local_runtime_turn_ingress_sequences') < pos('local_runtime_turn_ingress'),
+     `child=${pos('local_runtime_turn_ingress_sequences')} parent=${pos('local_runtime_turn_ingress')}`);
+  ok('primary row stays last', out[out.length - 1].kind === 'primary', JSON.stringify(out.map(e => e.kind)));
+  ok('no entry lost', out.length === plan.length, `${out.length} vs ${plan.length}`);
+  ok('independent entries keep stable order', pos('local_runtime_message_rows') < pos('local_runtime_sessions_fts'));
+  // a cascade child whose parent is NOT session-keyed still comes out before the
+  // primary row, and nothing is dropped
+  ok('orphan cascade not dropped', pos('local_runtime_v2_memory_execution_tasks') >= 0);
+  ok('cycle does not drop entries', (() => {
+    const cyclic = [
+      { table: 'a', kind: 'cascade', parentTable: 'b' },
+      { table: 'b', kind: 'cascade', parentTable: 'a' },
+      { table: 'c', kind: 'primary' },
+    ];
+    return s._orderPlan(cyclic).length === 3;
+  })());
+}
+
 // ------------------------------------------------------------------ inspect
 console.log('\n=== inspect formats ===');
 ok('EXPORT_FORMATS has jsonl', EXPORT_FORMATS.includes('jsonl'));
 ok('EXPORT_FORMATS has markdown', EXPORT_FORMATS.includes('markdown'));
 ok('session id prefix', SESSION_ID_PREFIX === 'mvs_');
+
+// ------------------------------------------------------------------ repair helpers
+console.log('\n=== repair: ownershipCols (pure) ===');
+{
+  const { ownershipCols } = await import('../src/repair.js');
+  eq('session_id is ownership', ownershipCols(['session_id']), ['session_id']);
+  eq('owner_session_id is ownership', ownershipCols(['owner_session_id']), ['owner_session_id']);
+  eq('from/to_session are NOT ownership', ownershipCols(['from_session', 'to_session']), []);
+  eq('mixed ownership filter', ownershipCols(['session_id', 'from_session', 'task_id', 'owner_session_id']), ['session_id', 'owner_session_id']);
+}
 
 console.log(`\n=== RESULT: ${pass} passed, ${fail} failed ===`);
 process.exit(fail === 0 ? 0 : 1);

@@ -72,6 +72,7 @@ export function parseFlags(argv) {
     dryRun: false, confirm: false, nonInteractive: false,
     noBackup: false, ascii: false, session: null,
     help: false, version: false,
+    scan: false,
     includeArchived: true, onlyArchived: false,
     json: false,
     format: null, status: null, kind: null, workspace: null,
@@ -104,6 +105,7 @@ export function parseFlags(argv) {
     if (a === '--confirm' || a === '--yes') { f.confirm = true; continue; }
     if (a === '--non-interactive') { f.nonInteractive = true; continue; }
     if (a === '--no-backup') { f.noBackup = true; continue; }
+    if (a === '--scan') { f.scan = true; continue; }
     if (a === '--ascii') { f.ascii = true; continue; }
     if (a === '--json') { f.json = true; continue; }
     if (a === '--messages' || a === '-m') { f.messages = true; continue; }

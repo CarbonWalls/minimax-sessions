@@ -7,6 +7,7 @@ import { Discovery } from './discovery.js';
 import { Lifecycle } from './lifecycle.js';
 import { Inspector, EXPORT_FORMATS } from './inspect.js';
 import { Safety } from './safety.js';
+import { Repairer } from './repair.js';
 import { trunc, shortWs, relAge, iso, wrapText, clipTo, fitLR, dispWidth } from './format.js';
 import {
   DB_PATH, MSM_DIR, MSM_LOG_DIR, MSM_BACKUP_DIR, dbExists, mcodeBinExists,
@@ -33,6 +34,9 @@ usage:
   mcode-sessions stats <id>            usage / statistics
   mcode-sessions active <id>           report whether a session is running
   mcode-sessions plan <id>             dry-run deletion plan
+  mcode-sessions repair <id>           detect + fix a corrupted session
+                                       (dry-run by default; --confirm applies)
+  mcode-sessions repair --scan         scan all data for corruption
   mcode-sessions resume <id>           launch mcode attached to a session
   mcode-sessions doctor                env / schema / native runtime check
 
@@ -108,6 +112,7 @@ export async function runCli(argv) {
       case 'stats':      return cmdStats(positional, flags, db, log);
       case 'active':     return cmdActive(positional, flags, db, log);
       case 'plan':       return cmdPlan(positional, flags, db, log);
+      case 'repair':     return await cmdRepair(positional, flags, db, log);
       case 'resume':
       case 'open':       return await cmdResume(positional, flags, db, log);
       default:
@@ -221,7 +226,10 @@ function filtersFromMatches(filters, s) {
 function cmdInspect(positional, flags, db, log) {
   const id = resolveId(positional, flags); assertExactId(id);
   const data = new Inspector({ log, db }).inspect(id);
-  out(flags, data, () => {
+  let issues = [];
+  try { issues = new Repairer({ log, db }).detect(id).issues; }
+  catch (e) { log.debug(`issue detection skipped: ${e.message}`); }
+  out(flags, { ...data, issues }, () => {
     const s = data.session;
     print(`session: ${s.title ?? '(untitled)'}`);
     print(`id: ${s.session_id}`);
@@ -234,6 +242,11 @@ function cmdInspect(positional, flags, db, log) {
     print(`messages: ${data.messageCount}   token rows: ${data.tokenUsage?.rows ?? 0}`);
     if (data.locks.length) print(`locks: ${data.locks.map(l => `${l.owner_kind} exp ${iso(l.expires_at_ms)}`).join(', ')}`);
     if (s.error_message) print(`error: ${s.error_message}`);
+    if (issues.length) {
+      print('');
+      print(`${issues.length} issue(s) detected — run \`mcode-sessions repair ${id}\` for details/fix:`);
+      for (const i of issues) print(`  [${i.severity}] ${i.table}: ${i.reason}`);
+    }
   });
   return 0;
 }
@@ -376,6 +389,68 @@ function cmdPlan(positional, flags, db, log) {
     for (const w of warnings) print(`  warn: ${w}`);
   });
   return 0;
+}
+
+// repair <id> -- detect + fix a corrupted session (dry-run by default).
+// repair --scan  -- scan all data for corruption.
+async function cmdRepair(positional, flags, db, log) {
+  const r = new Repairer({ log, db });
+
+  if (flags.scan) {
+    const rep = r.scan();
+    if (flags.json) { process.stdout.write(JSON.stringify(rep, null, 2) + '\n'); return rep.healthy ? 0 : 1; }
+    print(`repair scan  (${rep.sessionsChecked} sessions checked)`, flags);
+    if (rep.healthy) { print('no corruption found', flags); return 0; }
+    for (const i of rep.issues) print(`  [${i.severity}] ${i.table}: ${i.reason}`, flags);
+    for (const u of rep.unloadable) print(`  [error] ${u.sessionId}: failed to load — ${u.reason}`, flags);
+    print('run `mcode-sessions repair <id> --confirm` to apply fixes.', flags);
+    return 1;
+  }
+
+  const id = resolveId(positional, flags); assertExactId(id);
+  const dryRun = flags.dryRun || !flags.confirm;
+  const report = await r.repair(id, {
+    dryRun,
+    confirm: flags.confirm && !flags.dryRun,
+    noBackup: flags.noBackup,
+  });
+
+  let exit;
+  if (report.failed) exit = 1;
+  else if (report.needsConfirm) exit = 4;
+  else if (report.dryRun) exit = 0;
+  else if (report.nothingToRepair) exit = 0;
+  else exit = report.verified ? 0 : 5;
+
+  if (flags.json) { process.stdout.write(JSON.stringify(report, null, 2) + '\n'); return exit; }
+
+  if (report.failed) { stderr(`repair FAILED — ${report.error}`); stderr(`backup: ${report.backupPath ?? 'none'}; transaction rolled back, nothing changed.`); return exit; }
+  if (report.nothingToRepair) { print(`${id}: healthy — no corruption found.`); return exit; }
+  if (report.needsConfirm) { print(`repair ${id} — found ${report.fixes.length} fix(es); re-run with --confirm to apply.`); return exit; }
+
+  if (report.dryRun) {
+    print(`DRY RUN — repair ${id}`, flags);
+    if (report.fixes.length) {
+      print(`would apply ${report.fixes.length} fix(es):`, flags);
+      for (const f of report.fixes) print(`  ${String(f.count).padStart(6)}  ${describeFix(f)}`, flags);
+    }
+    print('nothing was changed. Re-run with --confirm to apply.', flags);
+    return exit;
+  }
+
+  // committed
+  print(`repair ${id}`, flags);
+  print(`backup: ${report.backupPath ?? '(disabled with --no-backup)'}`, flags);
+  for (const a of report.applied) print(`  removed ${a.deleted} row(s) from ${a.table}`, flags);
+  print(`verified: ${report.verified ? 'OK — fixable corruption resolved' : 'WARNING — some issues remain'}`, flags);
+  for (const i of report.remainingIssues ?? []) if (i.fix) print(`  remaining: ${String(i.rows).padStart(5)}  ${i.table} — ${i.reason}`, flags);
+  return exit;
+}
+
+function describeFix(f) {
+  if (f.action.startsWith('delete-orphans')) return `orphaned ${f.table} (${f.idCol} with no owning ${f.parent})`;
+  if (f.action === 'delete-residue') return `residue in ${f.table} (${f.key} with no session row)`;
+  return `${f.action} on ${f.table}`;
 }
 
 async function cmdResume(positional, flags, db, log) {
