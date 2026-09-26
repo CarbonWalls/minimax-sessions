@@ -5,10 +5,14 @@ A standalone, dependency-free terminal tool for inspecting and managing
 interface: browse, search, filter, inspect, rename, archive, fork, export, and
 delete the sessions stored in the MiniMax runtime database.
 
-Built and verified against **MiniMax Code 0.5.3** on linux/arm64
-(termux/proot). The reverse-engineering behind every operation is documented in
-**[RESEARCH.md](./RESEARCH.md)** — read that first if you want to know *why*
-each operation is implemented the way it is.
+Built and verified against **MiniMax Code 0.5.5** on linux/arm64
+(termux/proot). mcode 0.5.5 persists every session as a dated directory tree
+under `~/.minimax/v2/sessions/` with an authoritative `messages.jsonl`; this
+tool inspects and exports that file at full fidelity (the earlier 0.5.2/0.5.3
+SQLite-based management features are unchanged and still work when the runtime
+database is present). The reverse-engineering behind every operation is
+documented in **[RESEARCH.md](./RESEARCH.md)** — read that first if you want to
+know *why* each operation is implemented the way it is.
 
 ## Requirements
 
@@ -35,6 +39,73 @@ node /root/mcode-session-manager/bin/mcode-sessions          # interactive TUI
 ln -s /root/mcode-session-manager/bin/mcode-sessions /usr/local/bin/mcode-sessions
 mcode-sessions
 ```
+
+## Deep session inspector (`store`)
+
+mcode 0.5.5 keeps the authoritative record stream on disk. `store` browses that
+tree and inspects/exports a session far beyond what a normal `/export` gives
+you, while treating the raw `messages.jsonl` as the single source of truth:
+
+```bash
+mcode-sessions store                     # TUI over the on-disk session store
+mcode-sessions store list [text]         # list sessions + derived metadata
+mcode-sessions store search <text>       # search names / ids / cwds / models
+mcode-sessions store inspect <ref>       # deep metadata + record counts
+mcode-sessions store verify <ref>        # integrity + tool pairing report
+mcode-sessions store export <ref>        # high-fidelity export (see below)
+mcode-sessions store show <ref>          # chronological event stream
+                                         #   --record N  one record
+                                         #   --raw       verbatim JSONL line
+                                         #   --tools     tool activity only
+```
+
+`<ref>` is any of an `mvs_` id, a session directory name, a session directory
+path, or a `messages.jsonl` path.
+
+Every session shows a derived **name** whose source is always displayed:
+`stored title` (the runtime's own column) → `stored compaction summary` →
+`first user message` (with injected `<system-reminder>` context stripped) →
+`derived (cwd + timestamp)`. A derived name is **never** written back into the
+session.
+
+### Export formats
+
+All exports land inside this tool's own checkout (`<checkout>/exports/`, or
+`$MSM_EXPORT_DIR`) — never in `~/.minimax`.
+
+| format | contents |
+|---|---|
+| `raw` | `raw_messages.jsonl` — byte-for-byte copy, sha256-verified against the source |
+| `json` | `detailed.json` — every record verbatim, unknown fields included |
+| `markdown` | `detailed.md` — readable chronological dump, one section per record |
+| `archive` | `<name>.tar.gz` — the complete ORIGINAL session directory, untouched |
+| `bundle` | a directory with raw + detailed json + markdown + `session_info.json` + `integrity.txt` + the original metadata sidecars + `MANIFEST.sha256` |
+| `info` | `session_info.json` alone, with `stored` vs `derived` clearly separated |
+| `integrity` | `integrity.txt` alone |
+
+`--redact` produces a clearly-labelled, best-effort redacted variant (API keys,
+bearer tokens, secret-looking values, private keys). It is **not** guaranteed
+complete — review it before sharing. The source session is never modified.
+
+### Integrity checking
+
+`store verify` reports totals, roles, content block types, tool calls/results,
+matched pairs, missing results, orphan results, duplicate ids, malformed
+records, an incomplete trailing record (a session being written right now),
+and every unknown role / block type / top-level / message / tool field — so a
+future mcode schema change surfaces as a new "unknown" entry instead of being
+silently consumed. The parser never normalises a record: each one keeps its
+exact source text and its parsed object, so raw exports are lossless and
+structured exports carry fields this tool does not yet understand.
+
+### Live sessions
+
+Sessions may be actively written by mcode. The parser streams the file, keeps a
+record that is not newline-terminated as a *malformed-but-preserved* entry, and
+reports `SESSION MAY CURRENTLY BE IN USE — trailing record is incomplete`
+rather than crashing or discarding it. Exports snapshot the source's size and
+sha256 before and after, and warn if the session moved during the export. The
+source is only ever opened for reading and is never locked.
 
 ## Interactive TUI (default)
 
@@ -66,7 +137,19 @@ j/k move  enter actions  / search  n/b page  a arch  s/t/w filter  x clear  r re
 - handles terminal resize and Ctrl-C cleanly; no mouse required
 
 Selecting a session opens an action menu (default highlight is *inspect*, never
-*delete*):
+*delete*). In the file-store TUI the same menu adds:
+
+```
+i  deep inspect (records)   metadata panel + chronological event stream
+e  export…                  pick a format; written into <checkout>/exports
+```
+
+The deep inspector's event stream renders the ORIGINAL stored order and
+distinguishes `USER` / `ASSISTANT` / `THINKING` / `TOOL CALL` / `TOOL RESULT`.
+From it: `enter` opens one record as pretty-printed JSON, `r` shows the
+verbatim source line, `t` toggles a tool-only view, `v` the integrity report,
+`/` + `n`/`N` search inside the session with match counts, and jumping between
+a tool call and its result is one key. Nothing is flattened away.
 
 ```
  session: debugging mcode
@@ -92,7 +175,15 @@ typing the last 8 characters of the session id before anything is removed.
 
 ```
 mcode-sessions                       # interactive TUI (default)
-mcode-sessions list [text]           # list sessions
+mcode-sessions store                 # TUI over the on-disk session store
+mcode-sessions store list [text]     # list file-store sessions
+mcode-sessions store search <text>   # search names / ids / cwds / models
+mcode-sessions store inspect <ref>   # deep metadata + record counts
+mcode-sessions store verify <ref>    # integrity / pairing report
+mcode-sessions store export <ref>    # --format raw|json|markdown|archive|
+                                      #          bundle|info|integrity
+mcode-sessions store show <ref>      # --record N --raw --tools
+mcode-sessions list [text]           # list sessions (runtime database)
 mcode-sessions search <text>         # search title/purpose/id (--messages also hits bodies)
 mcode-sessions inspect <id>          # compact metadata
 mcode-sessions rename <id> <title>   # rename
@@ -100,17 +191,24 @@ mcode-sessions archive <id>          # archive
 mcode-sessions unarchive <id>        # unarchive
 mcode-sessions fork <id>             # fork via the native runtime
 mcode-sessions delete <id>           # --dry-run by default; --confirm to run
-mcode-sessions export <id>           # --format markdown|json|jsonl|metadata  [--out FILE]
+mcode-sessions export <id>           # --format markdown|json|jsonl|metadata
 mcode-sessions stats <id>            # usage / statistics
 mcode-sessions active <id>           # is it running?
 mcode-sessions plan <id>             # dry-run deletion plan
 mcode-sessions resume <id>           # launch mcode attached to a session (--dry-run to preview)
 mcode-sessions doctor                # environment / schema / native-runtime health check
+```
+
+The `store` commands work with **no database at all** — they read the session
+tree directly — so they keep working after the runtime has dropped old
+sessions from its index. When the SQLite database *is* present, its title /
+status / kind / workspace / parent columns enrich the same rows.
 
 filters: --archived/--no-archived/--only-archived  --status <s>  --kind <k>
          --workspace <dir>  --parent <id>
 safety:  --dry-run  --confirm  --no-backup  --session <id>
-output:  --json  --limit <n>  --offset <n>  --out <file>  --format <fmt>
+output:  --json  --limit <n>  --offset <n>  --out <file|dir>  --format <fmt>
+         --record <n>  --max-records <n>  --redact  --tools  --raw
          --ascii  --no-color  --debug/--verbose
 ```
 
@@ -125,6 +223,8 @@ mcode-sessions list --limit 20 --no-archived
 mcode-sessions delete mvs_220667ba0ba94c14aa48225ae1e72540 --dry-run
 mcode-sessions delete mvs_220667ba0ba94c14aa48225ae1e72540 --confirm
 mcode-sessions export mvs_e16989c9a5da444bacbd447ac45ada5f --format jsonl --out s.jsonl
+mcode-sessions store export mvs_13d9801f4c4c43a084f8908f8956c612 --format bundle
+mcode-sessions store verify mvs_13d9801f4c4c43a084f8908f8956c612
 mcode-sessions doctor
 ```
 
@@ -173,10 +273,14 @@ src/discovery.js          session discovery: list/filter/count/messages/usage
 src/safety.js             active detection, dry-run plan builder, backup + retention
 src/lifecycle.js          rename / archive / fork / delete (native-first)
 src/inspect.js            inspect / stats / export (markdown|json|jsonl|metadata)
+src/store.js              0.5.5 file-store index (dated session tree, lazy per-session loads)
+src/jsonl.js              streaming messages.jsonl parser: records, pairing, integrity, names
+src/exportx.js            raw / json / markdown / archive / bundle / info / integrity exports
 src/theme.js              mcode `minimax` theme palette + colour degradation
 src/tui.js                keyboard-only terminal UI
-src/cli.js                CLI command surface (incl. doctor, resume)
+src/cli.js                CLI command surface (incl. doctor, resume, store)
 tests/unit.test.mjs       fast pure-function tests (no DB required)
+tests/jsonl.test.mjs      parser + store + exporter tests on synthetic fixtures
 tests/tui.test.mjs        headless TUI state-machine checks
 tests/mutations.test.mjs  mutation checks against disposable sessions
 tools/scratch-ctx.mjs     RESEARCH helper (bounded context around a regex)
@@ -223,12 +327,20 @@ Behaviour details, all matching how mcode itself behaves:
 ## Tests
 
 ```bash
-npm test                # unit + tui + mutations
+npm test                # unit + jsonl + tui + mutations
 npm run test:unit       # fast pure-function checks (no DB / no mcode needed)
+npm run test:jsonl      # parser / store / exporter against synthetic fixtures
 npm run test:tui        # headless TUI: keys, screens, two-step delete confirm
 npm run test:mutations  # creates disposable sessions, mutates, verifies the DB
 npm run doctor          # environment / schema / native ACP health check
 ```
+
+The `jsonl` suite builds its whole session tree in an OS temp directory and
+removes it afterwards; the real `~/.minimax/v2/sessions` is only ever read
+(and only by one opt-in read-only smoke check). Raw export byte-identity,
+unknown-field survival, thinking/tool-argument/tool-result preservation,
+missing/orphan/duplicate pairing, malformed and incomplete-trailing records,
+redaction, and source-immutability are all asserted.
 
 All suites exit non-zero on any failure. Sessions created by the mutation/TUI
 suites are removed by those suites themselves. Paths are resolved relative to

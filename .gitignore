@@ -5,3 +5,7 @@ node_modules/
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+
+# generated exports and indexes always stay inside this checkout
+exports/
+.cache/

@@ -13,12 +13,16 @@
 // visible and the end of the list comes into view a half-page before you reach
 // it. Position shows x(current)/y(total); pushing past either end wraps around.
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { Discovery } from './discovery.js';
 import { Lifecycle } from './lifecycle.js';
 import { Inspector } from './inspect.js';
 import { Repairer } from './repair.js';
 import { SqliteAdapter } from './sqlite.js';
-import { MCODE_BIN, dbExists, mcodeBinExists } from './env.js';
+import { StoreIndex, preload } from './store.js';
+import { parseSession, integrityReport } from './jsonl.js';
+import { exportSession, EXPORT_FORMATS as STORE_FORMATS, sessionInfo, renderIntegrity } from './exportx.js';
+import { MCODE_BIN, dbExists, mcodeBinExists, SESSIONS_DIR, EXPORT_DIR } from './env.js';
 import { Theme, dispWidth, padTo, clipTo } from './theme.js';
 import { trunc as truncShared, shortWs, relAge, iso, fitLR } from './format.js';
 
@@ -35,6 +39,8 @@ const ACTION_MENU = [
   ['7', 'inspect'],
   ['8', 'export'],
   ['9', 'usage / stats'],
+  ['i', 'deep inspect (records)'],
+  ['e', 'export… (file store)'],
   ['0', 'back'],
 ];
 const DEFAULT_MENU_IDX = 6; // 'inspect' — never 'delete'
@@ -47,27 +53,34 @@ function statusRole(s) {
   return 'dim';
 }
 
-export async function runTui({ flags, log }) {
-  if (!dbExists()) {
+export async function runTui({ flags, log, storeMode = false }) {
+  // The file-store browser works with no database at all (mcode 0.5.5 keeps
+  // the authoritative record stream on disk); the SQLite browser is the
+  // runtime's live index. Auto-pick the store when that is all there is.
+  const storeAvailable = !!SESSIONS_DIR && existsSync(SESSIONS_DIR);
+  const useStore = storeMode || (storeAvailable && !dbExists());
+  if (!useStore && !dbExists()) {
     process.stderr.write('runtime database not found. Set MSM_RUNTIME_DATA_DIR or check the install.\n');
     return 2;
   }
-  const t = new Tui({ flags, log });
+  const t = new Tui({ flags, log, storeMode: useStore });
   try { return await t.run(); }
   finally { t.destroy(); }
 }
 
 export class Tui {
-  constructor({ flags, log }) {
+  constructor({ flags, log, storeMode = false } = {}) {
     this.flags = flags;
     this.log = log;
+    this.storeMode = !!storeMode;
     this.theme = new Theme({ color: flags.color });
     this.color = this.theme.on; // kept for compatibility
     this.glyphs = flags.ascii ? GLYPHS_ASCII : GLYPHS_UNICODE;
-    this.db = new SqliteAdapter({ log });
+    this.db = (!this.storeMode && dbExists()) ? new SqliteAdapter({ log }) : null;
     this.discovery = new Discovery({ log, db: this.db });
     this.lifecycle = new Lifecycle({ log, db: this.db });
     this.inspector = new Inspector({ log, db: this.db });
+    this.store = new StoreIndex({ log, db: this.db });
 
     this.screen = 'browser';
     this.cursor = 0;      // index into the current window of rows
@@ -100,6 +113,16 @@ export class Tui {
     this.searchRows = null;
     this._searchKey = null;
     this._facets = { archived: 0, active: 0 };
+    // ---- deep inspector (file store) ----
+    this.entry = null;       // SessionEntry being inspected
+    this.parsed = null;      // parseSession() result for it
+    this.evOffset = 0;       // first event index shown
+    this.evCursor = 0;       // cursor into the visible event window
+    this.evFilter = 'all';   // 'all' | 'tools'
+    this.evMatches = null;   // indices of in-session search hits
+    this.evMatchCursor = -1;
+    this.evSearchBuf = '';
+    this._evLoading = false;
   }
 
   async run() {
@@ -166,6 +189,9 @@ export class Tui {
       else if (this.screen === 'output') this.handleOutputKey(k);
       else if (this.screen === 'filter') this.handleFilterKey(k);
       else if (this.screen === 'menu') this.handleMenuKey(k);
+      else if (this.screen === 'detail') this.handleDetailKey(k);
+      else if (this.screen === 'events') this.handleEventsKey(k);
+      else if (this.screen === 'exportm') this.handleExportMenuKey(k);
       else this.handleBrowserKey(k);
     }
   }
@@ -185,9 +211,12 @@ export class Tui {
     if (k.name === 'pgdn' || k.name === 'space' || k.char === 'n') return this.nextPage();
     if (k.name === 'pgup' || k.char === 'b' || k.char === 'p') return this.prevPage();
     if (k.name === 'enter') return this.openMenu(this.rows[this.cursor]);
+    if (k.char === 'i') return this.openDeepInspect(this.rows[this.cursor]);
+    if (k.char === 'e') return this.openExportMenu(this.rows[this.cursor]);
     if (k.char === '/') return this.beginSearch();
     if (k.char === 'r') { this.message = 'refreshed'; this.messageKind = 'info'; this.refresh(); return this.render(); }
     if (k.char === 'a') return this.cycleArchived();
+    if (this.storeMode) return; // s/t/w filters need the SQLite index
     if (k.char === 's') return this.openFilter('status');
     if (k.char === 't') return this.openFilter('kind');
     if (k.char === 'w') return this.openFilter('workspace');
@@ -206,13 +235,18 @@ export class Tui {
   // moving, instead of pinning it to the bottom row (see _followCursor).
   get hasMore() { return this.rows.length < this.total; }
 
-  // Append one batch from the DB at the current load tail, deduped by session id
-  // so a dataset that shifts mid-scroll can never produce duplicate rows.
-  // `force` seeds the first batch from refresh(): hasMore() compares loaded rows
-  // against this.total, which is 0 until the first query lands, so the seed must
-  // not be gated on it (an empty dataset still loads zero rows and then stops).
+  // Append one batch at the current load tail. In DB mode this is a paged
+  // query; in file-store mode the whole filtered list is already in memory
+  // (a pure readdir walk), so it slices that list. Both accumulate into
+  // this.rows and dedupe by id, so scrolling never shows a row twice even if
+  // the underlying data shifts mid-scroll.
+  // `force` seeds the first batch from refresh(): hasMore() compares loaded
+  // rows against this.total, which is 0 until the first query lands, so the
+  // seed must not be gated on it (an empty dataset still loads zero rows and
+  // then stops).
   loadMore(force = false) {
     if (!force && !this.hasMore) return;
+    if (this.storeMode) return this.loadMoreStore();
     const batch = Math.max(this.pageSize, 100);
     const offset = this.rows.length;
     const { rows, total } = this.discovery.list({ limit: batch, offset, filters: this.filters });
@@ -327,6 +361,21 @@ export class Tui {
     const key = q + '\u0000' + JSON.stringify(this.filters.archived);
     if (this.searchRows && this._searchKey === key) return this.searchRows;
     this._searchKey = key;
+    if (this.storeMode) {
+      const f = { ...this.filters, ...(q ? { q } : {}) };
+      let rows = this.store.entries();
+      if (f.archived === 'only') rows = rows.filter(e => e.archived);
+      else if (f.archived === 'exclude') rows = rows.filter(e => !e.archived);
+      if (q) {
+        const lq = q.toLowerCase();
+        rows = rows.filter(e => [e.sessionId, e.dirName, e.workspaceDir, e.storedTitle].some(v => v && String(v).toLowerCase().includes(lq)));
+      }
+      const total = rows.length;
+      this.searchRows = { rows: rows.slice(0, this.pageSize), total, q };
+      // names for the shown hits resolve after this frame
+      preload(this.searchRows.rows, async e => { await e.nameInfo(); }).then(() => this.render()).catch(() => {});
+      return this.searchRows;
+    }
     const { rows, total } = this.discovery.list({
       limit: this.pageSize, offset: 0,
       filters: { ...this.filters, ...(q ? { q } : {}) },
@@ -371,6 +420,18 @@ export class Tui {
     if (key === '7') return this.showInspect(s);
     if (key === '8') return this.showExport(s);
     if (key === '9') return this.showStats(s);
+    if (key === 'i') return this.openDeepInspect(s);
+    if (key === 'e') return this.openExportMenu(s);
+  }
+
+  needsDb(s, label) {
+    if (s?.session_id && !this.discovery.exists(s.session_id)) {
+      this.message = `${label} needs the runtime index — this session is file-store only`;
+      this.messageKind = 'warn';
+      this.render();
+      return false;
+    }
+    return true;
   }
 
   // -------------------------------------------------------------- confirm
@@ -402,6 +463,16 @@ export class Tui {
     if (k.name === 'ctrlc') return this.quit(0);
     if (k.name === 'up' || k.char === 'k') { this._outputScroll = Math.max(0, this._outputScroll - 1); return this.render(); }
     if (k.name === 'down' || k.char === 'j') { this._outputScroll = this._outputScroll + 1; return this.render(); }
+    if (k.name === 'pgdn' || k.name === 'space') { this._outputScroll += Math.max(1, this.height - 4); return this.render(); }
+    if (k.name === 'pgup') { this._outputScroll = Math.max(0, this._outputScroll - (this.height - 4)); return this.render(); }
+    // from a record view, t/r/v/e jump back into the inspector instead of
+    // leaving it, so the deep-inspect keys work from any of its sub-screens
+    if (this.prevScreen === 'events' || this.prevScreen === 'detail') {
+      if (k.char === 't' && this.prevScreen === 'events') { this.evFilter = this.evFilter === 'tools' ? 'all' : 'tools'; this.evOffset = 0; this.evCursor = 0; this.evMatches = null; this.screen = 'events'; return this.render(); }
+      if (k.char === 'v') { this.screen = 'events'; return this.showIntegrity(); }
+      if (k.char === 'e') { this.screen = 'detail'; return this.openExportMenu(this.entry); }
+      if (k.char === 'r' && this.prevScreen === 'detail') { this.screen = 'detail'; return this.showRawJsonl(); }
+    }
     this._outputScroll = 0;
     this.screen = this.prevScreen || 'browser';
     this.render();
@@ -419,6 +490,7 @@ export class Tui {
 
   // -------------------------------------------------------------- actions
   refresh() {
+    if (this.storeMode) return this.refreshStore();
     // Full reload from the top, then restore a valid position. Accumulation is
     // re-seeded so a filter change / mutation / manual refresh sees fresh data
     // while ordinary scrolling never clears the loaded list.
@@ -437,6 +509,50 @@ export class Tui {
     // on every keystroke repaint
     try { this._facets = this.discovery.facetCounts(); } catch { /* keep last */ }
     this.log?.verbose(`refresh loaded=${this.rows.length} total=${this.total} cursor=${this.cursor} filters=${JSON.stringify(this.filters)}`);
+  }
+
+  // File-store counterpart of loadMore: the full filtered list is already
+  // materialised by refreshStore, so this only slices the next batch off it.
+  loadMoreStore() {
+    const all = this._storeAll ?? [];
+    const take = all.slice(this.rows.length, this.rows.length + Math.max(this.pageSize, 100));
+    const known = new Set(this.rows.map(r => r.sessionId));
+    for (const r of take) if (!known.has(r.sessionId)) { this.rows.push(r); known.add(r.sessionId); }
+  }
+
+  // File-store browser: the index is a pure readdir walk (no file reads), and
+  // names are warmed for the visible window only, afterwards.
+  refreshStore() {
+    const entries = this.store.entries();
+    this.store.enrich();
+    let rows = entries;
+    const f = this.filters;
+    if (f.archived === 'only') rows = rows.filter(e => e.archived);
+    else if (f.archived === 'exclude') rows = rows.filter(e => !e.archived);
+    if (f.q) {
+      const q = String(f.q).toLowerCase();
+      rows = rows.filter(e => [e.sessionId, e.dirName, e.workspaceDir, e.storedTitle].some(v => v && String(v).toLowerCase().includes(q)));
+    }
+    // same accumulation model as the DB browser: keep the whole filtered list
+    // and expose it page by page so the shared cursor/viewport code works.
+    this._storeAll = rows;
+    this.total = rows.length;
+    this.rows = [];
+    this.offset = 0;
+    this.cursor = 0;
+    this.loadMore(true);
+    this.ensureLoaded(this.cursor + this.pageSize);
+    this._facets = this.store.facetCounts(rows);
+    // warm names + relations for this window in the background, then repaint
+    const win = this.rows.slice();
+    preload(win, async e => { await e.populate(); await e.nameInfo(); })
+      .then(() => { if (this.screen === 'browser') this.render(); })
+      .catch(() => {});
+    // a search also needs names beyond this window to be complete
+    if (f.q) {
+      const span = rows.slice(0, Math.min(rows.length, 400));
+      preload(span, async e => { await e.nameInfo(); }).catch(() => {});
+    }
   }
 
   openMenu(row) {
@@ -609,6 +725,297 @@ export class Tui {
     this.render();
   }
 
+  // ------------------------------------------------- deep inspector (store)
+  // Resolve a browser/menu row to a file-store entry. Works from the SQLite
+  // list too (the row carries a session_id), so deep inspect is reachable
+  // from the normal menu as well as from `store`.
+  storeEntryFor(s) {
+    if (!s) return null;
+    const id = s.session_id ?? s.sessionId;
+    let e = id ? this.store.byId(id) : null;
+    if (!e && s.dir) e = this.store._entryForDir(s.dir);
+    if (!e && id) {
+      // a SQLite row whose session dir is not (yet) on disk
+      this.message = `no on-disk session for ${id.slice(0, 16)}… (nothing to inspect)`;
+      this.messageKind = 'warn';
+      this.render();
+      return null;
+    }
+    return e;
+  }
+
+  async openDeepInspect(s) {
+    const entry = this.storeEntryFor(s);
+    if (!entry) return;
+    // remember where we came from: detail's `esc` returns there (its sub-screens
+    // return to detail, so they must not overwrite this)
+    this.detailReturn = this.screen === 'menu' ? 'menu' : 'browser';
+    this.entry = entry;
+    this.parsed = null;
+    this.evOffset = 0; this.evCursor = 0; this.evFilter = 'all';
+    this.evMatches = null; this.evMatchCursor = -1; this.evSearchBuf = '';
+    await entry.populate();
+    this.showDetail();
+    if (entry.hasMessages) {
+      this._evLoading = true;
+      this.render();
+      try {
+        this.parsed = await parseSession(entry.messagesPath);
+      } catch (e) {
+        this.message = `parse failed: ${e.message}`;
+        this.messageKind = 'warn';
+      }
+      this._evLoading = false;
+      // refresh whichever screen is showing this session's metadata; never pull
+      // the user back if they already navigated away from the detail panel
+      if (this.screen === 'detail') this.showDetail(true);
+      else if (this.screen === 'events' || this.screen === 'exportm') this.render();
+    } else {
+      this.message = 'session has no messages.jsonl (empty/compacted)';
+      this.messageKind = 'warn';
+      this.render();
+    }
+  }
+
+  // metadata panel + the key map for everything below it
+  showDetail(keepScreen = false) {
+    const e = this.entry;
+    const nm = e?._name ?? { name: '(unknown)', source: '?' };
+    const p = this.parsed;
+    const T = this.theme;
+    const L = [];
+    L.push(T.style({ bold: true, fg: 'brand' }, `name: ${nm.name}`));
+    L.push(`${T.fg('muted', 'name source:')} ${T.fg(nm.source?.startsWith('stored') ? 'success' : 'text', nm.source ?? '?')}${nm.firstLineTruncated ? '  (first line truncated)' : ''}`);
+    L.push(`${T.fg('muted', 'session id:')} ${T.fg('dim', e.sessionId)}`);
+    L.push(`${T.fg('muted', 'source:')} ${T.fg('dim', e.messagesPath ?? '(none)')}`);
+    L.push(`${T.fg('muted', 'created:')} ${iso(e.createdAtMs)}   ${T.fg('muted', 'modified:')} ${iso(e.updatedAtMs)}`);
+    L.push(`${T.fg('muted', 'file size:')} ${fmtBytesTui(e.messagesSize)}${e.messagesSize ? ` (${e.messagesSize} bytes)` : ''}`);
+    if (e.status || e.archived || e.sessionKind) {
+      L.push(`${T.fg('muted', 'status:')} ${e.status ?? '?'}${e.archived ? ' (archived)' : ''}   ${T.fg('muted', 'kind:')} ${e.sessionKind ?? '?'}`);
+    }
+    if (e.workspaceDir) L.push(`${T.fg('muted', 'cwd:')} ${e.workspaceDir}`);
+    if (e.parentId) L.push(`${T.fg('muted', 'parent:')} ${e.parentId}${e.isBranch ? '  (branch/subagent)' : ''}`);
+    L.push(`${T.fg('muted', 'runtime index:')} ${e.db ? 'yes' : 'no (file-store only)'}`);
+    if (p) {
+      const s = p.stats;
+      L.push(`${T.fg('muted', 'records:')} ${s.records}   ${T.fg('muted', 'turns:')} ${s.turnCount}`);
+      L.push(`${T.fg('muted', 'roles:')} ${T.fg('text', fmtCountsTui(s.roles))}`);
+      L.push(`${T.fg('muted', 'blocks:')} ${T.fg('text', fmtCountsTui(s.blockTypes))}`);
+      L.push(`${T.fg('muted', 'tools:')} ${T.fg('text', fmtCountsTui(s.tools))}`);
+      const pr = p.pairing;
+      L.push(`${T.fg('muted', 'calls/results:')} ${T.fg('text', `${s.toolCalls}/${s.toolResults}`)}   ${T.fg('muted', 'matched:')} ${T.fg(pr.matched === s.toolCalls && s.toolCalls === s.toolResults ? 'success' : 'warning', String(pr.matched))}   ${T.fg('muted', 'missing:')} ${pr.missingResults.length}   ${T.fg('muted', 'orphan:')} ${pr.orphanResults.length}`);
+      const models = Object.keys(s.models), providers = Object.keys(s.providers);
+      if (models.length) L.push(`${T.fg('muted', 'model:')} ${models.join(', ')}   ${T.fg('muted', 'provider:')} ${providers.join(', ')}`);
+      if (s.malformed) L.push(T.fg('warning', `WARNING: ${s.malformed} malformed record(s)`));
+      if (s.incompleteTrailing) L.push(T.fg('warning', 'WARNING: SESSION MAY CURRENTLY BE IN USE — trailing record is incomplete'));
+    } else if (this._evLoading) {
+      L.push(T.fg('muted', 'parsing records…'));
+    }
+    this.outputText = L.join('\n');
+    this.outputTitle = 'deep inspect';
+    this._outputScroll = 0;
+    if (!keepScreen) { this.prevScreen = 'detail'; this.screen = 'detail'; }
+    this.render();
+  }
+
+  handleDetailKey(k) {
+    if (k.name === 'ctrlc') return this.quit(0);
+    if (k.name === 'up' || k.char === 'k') { this._outputScroll = Math.max(0, this._outputScroll - 1); return this.render(); }
+    if (k.name === 'down' || k.char === 'j') { this._outputScroll = this._outputScroll + 1; return this.render(); }
+    if (k.name === 'escape' || k.char === 'q' || k.name === 'backspace') { this.screen = this.detailReturn || 'browser'; return this.render(); }
+    if (k.name === 'enter') return this.openEvents('all');
+    if (k.char === 't') return this.openEvents('tools');
+    if (k.char === 'v') return this.showIntegrity();
+    if (k.char === 'r') return this.showRawJsonl();
+    if (k.char === 'm') return this.showMarkdown();
+    if (k.char === 'e') return this.openExportMenu(this.entry);
+    if (k.char === 'i') return this.showDetail();
+  }
+
+  // chronological event stream (original stored order, never re-sorted)
+  openEvents(filter = 'all') {
+    this.evFilter = filter;
+    this.evOffset = 0; this.evCursor = 0;
+    this.evMatches = null; this.evMatchCursor = -1;
+    this.prevScreen = 'detail';
+    this.screen = 'events';
+    if (this.evSearchBuf && this.parsed) this.computeEventSearch();
+    this.render();
+  }
+  get visibleEvents() {
+    if (!this.parsed) return [];
+    let evs = this.parsed.events;
+    if (this.evFilter === 'tools') {
+      evs = evs.filter(ev => ev.role === 'toolResult' || (ev.blocks || []).some(b => b.kind === 'toolCall'));
+    }
+    return evs;
+  }
+  handleEventsKey(k) {
+    if (k.name === 'ctrlc') return this.quit(0);
+    if (k.name === 'escape' || k.char === 'q' || k.name === 'backspace') { this.screen = 'detail'; return this.render(); }
+    const evs = this.visibleEvents;
+    const n = evs.length;
+    if (k.name === 'up' || k.char === 'k') {
+      if (this.evCursor > 0) { this.evCursor--; this.maybeScrollEvents(); return this.render(); }
+      if (this.evOffset > 0) { this.evOffset = Math.max(0, this.evOffset - this.eventPageSize); this.evCursor = Math.min(this.evCursor, Math.max(0, n - this.evOffset - 1)); return this.render(); }
+      this.evOffset = Math.max(0, n - this.eventPageSize); this.evCursor = Math.max(0, n - this.evOffset - 1); return this.render();
+    }
+    if (k.name === 'down' || k.char === 'j') {
+      if (this.evOffset + this.evCursor < n - 1) { this.evCursor++; this.maybeScrollEvents(); return this.render(); }
+      this.evOffset = 0; this.evCursor = 0; return this.render();
+    }
+    if (k.name === 'pgdn' || k.name === 'space') { this.evOffset = Math.min(Math.max(0, n - this.eventPageSize), this.evOffset + this.eventPageSize); return this.render(); }
+    if (k.name === 'pgup') { this.evOffset = Math.max(0, this.evOffset - this.eventPageSize); return this.render(); }
+    if (k.name === 'home' || k.char === 'g') { this.evOffset = 0; this.evCursor = 0; return this.render(); }
+    if (k.name === 'end' || k.char === 'G') { this.evOffset = Math.max(0, n - this.eventPageSize); this.evCursor = Math.max(0, n - this.evOffset - 1); return this.render(); }
+    if (k.name === 'enter') return this.showEventRecord(this.currentEvent());
+    if (k.char === 't') { this.evFilter = this.evFilter === 'tools' ? 'all' : 'tools'; this.evOffset = 0; this.evCursor = 0; this.evMatches = null; return this.render(); }
+    if (k.char === 'r') return this.showEventRecord(this.currentEvent(), true);
+    if (k.char === 'v') return this.showIntegrity();
+    if (k.char === 'e') return this.openExportMenu(this.entry);
+    if (k.char === '/') return this.beginEventSearch();
+    if (k.char === 'n') return this.gotoMatch(1);
+    if (k.char === 'N' || k.char === 'p') return this.gotoMatch(-1);
+  }
+  get eventPageSize() { return Math.max(1, this.height - 5); }
+  maybeScrollEvents() {
+    const ps = this.eventPageSize;
+    if (this.evCursor >= ps) { this.evOffset += this.evCursor - ps + 1; this.evCursor = ps - 1; }
+    if (this.evOffset + this.evCursor >= this.visibleEvents.length) this.evCursor = Math.max(0, this.visibleEvents.length - this.evOffset - 1);
+  }
+  currentEvent() {
+    const evs = this.visibleEvents;
+    return evs[this.evOffset + this.evCursor] ?? null;
+  }
+
+  // search INSIDE the selected session's records
+  beginEventSearch() {
+    this.inputPrompt = 'search records:';
+    this.inputBuf = this.evSearchBuf;
+    this.prevScreen = 'events';
+    this.screen = 'input';
+    this.inputCb = v => {
+      this.evSearchBuf = v;
+      this.screen = 'events';
+      if (v.trim()) this.computeEventSearch(); else { this.evMatches = null; this.evMatchCursor = -1; }
+      this.render();
+    };
+    this.render();
+  }
+  computeEventSearch() {
+    const q = String(this.evSearchBuf).toLowerCase();
+    const hits = [];
+    for (const ev of this.visibleEvents) {
+      const hay = [ev.text, ev.role, ev.toolName, ev.toolCallId, ev.messageId, ev.turnId, ev.model].join('\n');
+      if (hay.toLowerCase().includes(q)) hits.push(ev.index);
+    }
+    this.evMatches = hits;
+    this.evMatchCursor = hits.length ? 0 : -1;
+    if (hits.length) this.jumpToEvent(hits[0]);
+  }
+  gotoMatch(dir) {
+    if (!this.evMatches?.length) { this.message = 'no matches — press / to search'; this.messageKind = 'info'; return this.render(); }
+    this.evMatchCursor = (this.evMatchCursor + dir + this.evMatches.length) % this.evMatches.length;
+    this.jumpToEvent(this.evMatches[this.evMatchCursor]);
+  }
+  jumpToEvent(eventIndex) {
+    const evs = this.visibleEvents;
+    const pos = evs.findIndex(ev => ev.index === eventIndex);
+    if (pos < 0) return this.render();
+    const ps = this.eventPageSize;
+    this.evOffset = Math.min(pos, Math.max(0, evs.length - ps));
+    this.evCursor = pos - this.evOffset;
+    this.message = `match ${this.evMatchCursor + 1}/${this.evMatches.length}`;
+    this.messageKind = 'info';
+    this.render();
+  }
+
+  // one record as pretty-printed JSON (or verbatim raw line) — nothing normalised
+  showEventRecord(ev, raw = false) {
+    if (!ev || !this.parsed) return;
+    const rec = this.parsed.records.find(r => r.index === ev.index);
+    if (!rec) return;
+    const title = `record ${rec.index} — ${ev.role ?? 'unknown'}${ev.toolName ? ` (${ev.toolName})` : ''}`;
+    const text = raw ? (rec.raw + '\n') : JSON.stringify(rec.obj ?? { parseError: rec.error, raw: rec.raw }, null, 2) + '\n';
+    this.showText(title, text, 'events');
+    this.message = rec.error ? `record ${rec.index} is malformed — shown verbatim` : '';
+    this.messageKind = 'warn';
+    this.render();
+  }
+
+  showText(title, text, prev) {
+    this.outputTitle = title;
+    this.outputText = text;
+    this._outputScroll = 0;
+    this.prevScreen = prev;
+    this.screen = 'output';
+    this.render();
+  }
+
+  async showIntegrity() {
+    if (!this.parsed) { this.message = 'still parsing…'; this.messageKind = 'info'; return this.render(); }
+    const nm = this.entry._name ?? await this.entry.nameInfo();
+    const info = sessionInfo(this.entry, this.parsed, { nameInfo: nm });
+    const integ = integrityReport(this.parsed, { name: nm.name, nameSource: nm.source });
+    this.showText('integrity', renderIntegrity(integ, info, this.parsed), 'detail');
+  }
+  showRawJsonl() {
+    if (!this.parsed) { this.message = 'still parsing…'; this.messageKind = 'info'; return this.render(); }
+    const text = this.parsed.records.map(r => r.raw).join('\n') + '\n';
+    this.showText(`raw jsonl — ${this.parsed.records.length} records`, text, 'detail');
+  }
+  async showMarkdown() {
+    if (!this.parsed) { this.message = 'still parsing…'; this.messageKind = 'info'; return this.render(); }
+    const { buildMarkdown } = await import('./exportx.js');
+    const nm = this.entry._name ?? await this.entry.nameInfo();
+    const info = sessionInfo(this.entry, this.parsed, { nameInfo: nm });
+    const integ = integrityReport(this.parsed, { name: nm.name, nameSource: nm.source });
+    // a TUI preview is capped so a huge session cannot flood the screen; the
+    // full export is `e` -> markdown / CLI export --format markdown
+    this.showText('markdown preview (first 200 records; `e` for full export)', buildMarkdown(this.entry, this.parsed, info, integ, { maxRecords: 200 }), 'detail');
+  }
+
+  // ------------------------------------------------------- export menu
+  openExportMenu(s) {
+    const entry = this.storeEntryFor(s);
+    if (!entry) return;
+    this.entry = entry;
+    this.foptions = STORE_FORMATS.map(f => ({ v: f, label: fmtLabel(f) }));
+    this.fcursor = STORE_FORMATS.indexOf('bundle');
+    this.prevScreen = this.screen === 'menu' ? 'menu' : 'detail';
+    this.screen = 'exportm';
+    this.render();
+  }
+  handleExportMenuKey(k) {
+    if (k.name === 'ctrlc') return this.quit(0);
+    if (k.name === 'escape' || k.char === 'q' || k.name === 'backspace') { this.screen = this.prevScreen || 'browser'; return this.render(); }
+    if (k.name === 'up' || k.char === 'k') { this.fcursor = Math.max(0, this.fcursor - 1); return this.render(); }
+    if (k.name === 'down' || k.char === 'j') { this.fcursor = Math.min(this.foptions.length - 1, this.fcursor + 1); return this.render(); }
+    if (k.name === 'enter') return this.runStoreExport(this.foptions[this.fcursor]);
+  }
+  async runStoreExport(opt) {
+    if (!opt) return;
+    if (!this.entry.hasMessages) {
+      this.message = 'session has no messages.jsonl — nothing to export';
+      this.messageKind = 'warn';
+      this.screen = this.prevScreen || 'browser';
+      return this.render();
+    }
+    this.message = `exporting ${opt.v}…`; this.messageKind = 'info'; this.render();
+    try {
+      const r = await exportSession(this.entry, { format: opt.v, redact: !!this.flags.redact });
+      this.message = `exported -> ${r.files.map(f => f.split('/').pop()).join(', ')}`;
+      this.messageKind = 'ok';
+      for (const w of r.warnings) { this.message = w; this.messageKind = 'warn'; }
+      this.log?.info(`store export ${opt.v}: ${r.files.join(', ')}`);
+    } catch (e) {
+      this.message = `export failed: ${e.message}`;
+      this.messageKind = 'warn';
+    }
+    this.screen = this.prevScreen || 'browser';
+    this.render();
+  }
+
   // ------------------------------------------------------------- render
   // Minimal in-place repaint. The previous frame is remembered and only the
   // lines that actually CHANGED are written, positioned with absolute cursor
@@ -630,6 +1037,9 @@ export class Tui {
     else if (this.screen === 'input') out = this.renderInput(W, line);
     else if (this.screen === 'filter') out = this.renderFilter(W, line);
     else if (this.screen === 'output') out = this.renderOutput(W, line);
+    else if (this.screen === 'detail') out = this.renderDetail(W, line);
+    else if (this.screen === 'events') out = this.renderEvents(W, line);
+    else if (this.screen === 'exportm') out = this.renderExportMenu(W, line);
     else out = [''];
 
     // Hard guarantee: no line may exceed the terminal width. A single
@@ -677,11 +1087,13 @@ export class Tui {
     const { cur, total } = this.positionInfo();
     const moreUp = this.offset > 0;
     const moreDown = this.hasMore;
+    const brand = this.storeMode ? ' mcode sessions (file store)' : ' mcode sessions';
     const head = clipTo(
-      T.style({ bold: true, fg: 'brand' }, ' mcode sessions')
+      T.style({ bold: true, fg: 'brand' }, brand)
       + '  ' + T.fg('muted', `n=${total}`)
-      + '  ' + T.fg('warning', `arch=${fac.archived}`)
-      + '  ' + T.fg('signal', `lock=${fac.active}`)
+      + (this.storeMode
+        ? '  ' + T.fg('muted', `disk=${fac.total}`) + '  ' + T.fg('signal', `idx=${fac.inDatabase}`)
+        : '  ' + T.fg('warning', `arch=${fac.archived}`) + '  ' + T.fg('signal', `lock=${fac.active}`))
       + (moreUp || moreDown ? '  ' + T.fg('dim', `${moreUp ? g.up : ''}${moreDown ? g.down : ''}`) : ''),
       W,
     );
@@ -691,7 +1103,12 @@ export class Tui {
     const start = this.offset + 1;                       // 1-based row number
     const shown = this.rows.slice(this.offset, this.offset + ps);
     if (!shown.length) rows.push(T.fg('muted', clipTo('(no match — / search, x clear)', W)));
-    for (let i = 0; i < shown.length; i++) rows.push(this.formatRow(shown[i], start + i, W, this.offset + i === this.cursor));
+    for (let i = 0; i < shown.length; i++) {
+      const sel = this.offset + i === this.cursor;
+      rows.push(this.storeMode
+        ? this.formatStoreRow(shown[i], start + i, W, sel)
+        : this.formatRow(shown[i], start + i, W, sel));
+    }
     while (rows.length < 2 + ps) rows.push('');
     rows.push(T.fg('border', line));
     const fdesc = [
@@ -711,6 +1128,42 @@ export class Tui {
     return rows;
   }
 
+  // A file-store row: derived name (+ its source), records, size, kind.
+  // Degrades to name + size on a narrow terminal.
+  formatStoreRow(e, n, W, sel) {
+    const g = this.glyphs;
+    const T = this.theme;
+    const nm = e._name;
+    const name = nm?.name ?? '…';
+    const rec = e.catalogCount != null ? `${e.catalogCount}` : (e.hasMessages ? '?' : '0');
+    const size = fmtBytesTui(e.messagesSize);
+    const kind = e.sessionKind && e.sessionKind !== 'conversation' ? ` <${e.sessionKind[0]}>` : '';
+    const branch = e.isBranch ? ' br' : '';
+    const ws = (!e.workspaceDir || e.workspaceDir === '/root') ? '' : ` @${shortWs(e.workspaceDir)}`;
+    const num = String(n).padStart(W < 46 ? 2 : 3);
+    const rightPlain = `${rec.padStart(3)}r ${size.padStart(7)}`;
+    if (W < 46) {
+      const leftBudget = Math.max(4, W - 1 - dispWidth(num) - 1 - dispWidth(rightPlain));
+      const plain = clipTo(`${sel ? g.arrow : ' '}${num} ${clipTo(name, leftBudget)} ${rightPlain}`, W);
+      if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
+      return clipTo([T.fg('dim', num), ' ', T.fg('text', clipTo(name, leftBudget)), ' ', T.fg('muted', rightPlain)].join(''), W);
+    }
+    const fixed = 1 + dispWidth(num) + 2 + dispWidth(kind) + dispWidth(branch) + dispWidth(ws) + 2 + dispWidth(rightPlain);
+    const title = clipTo(name, Math.max(3, Math.min(46, W - fixed)));
+    const leftPlain = `${sel ? g.arrow : ' '}${num}  ${title}${kind}${branch}${ws}`;
+    const plain = clipTo(fitLR(leftPlain, rightPlain, W), W);
+    if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(plain, W));
+    const lw = dispWidth(leftPlain), rw = dispWidth(rightPlain);
+    const gap = Math.max(1, W - lw - rw);
+    return clipTo(
+      T.fg('dim', `${sel ? g.arrow : ' '}${num}`) + '  '
+      + T.fg('text', title) + T.fg('muted', kind) + T.fg('dim', branch) + T.fg('dim', ws)
+      + ' '.repeat(gap)
+      + T.fg('muted', rec.padStart(3)) + T.fg('dim', 'r ') + T.fg('muted', size.padStart(7)),
+      W,
+    );
+  }
+
   // shared bottom hint; each tier's string is <= that tier's max width so
   // clipTo never has to cut a word. `msg` (when present) is prepended and the
   // combined result is still hard-clipped to W.
@@ -721,7 +1174,16 @@ export class Tui {
     // a one-shot message when one is pending)
     const msg = this.message ? this.colored(this.message, this.messageKind) + '  ' : '';
     const room = Math.max(8, W2 - (msg ? dispWidth(msg) : 0));
-    const tiers = [
+    const tiers = this.storeMode ? [
+      [16, 'j/k  enter  /  q'],
+      [30, 'j/k move  enter  /  x clear  q'],
+      [45, 'j/k move  enter  /  n page  x clear  q'],
+      [53, 'j/k move  enter  i inspect  n page  q'],
+      [68, 'j/k move  enter actions  i inspect  e export  n page  q'],
+      [74, 'j/k move  enter actions  i inspect  e export  n page  x clear  q'],
+      [82, 'j/k move  enter actions  i inspect  e export  n page  a arch  x clear  q'],
+      [93, 'j/k move  enter actions  i inspect  e export  n page  a arch  x clear  r refresh  q quit'],
+    ] : [
       [16, 'j/k  enter  /  q'],
       [30, 'j/k move  enter  /  x clear  q'],
       [45, 'j/k move  enter  /  n/b page  x clear  q quit'],
@@ -805,7 +1267,11 @@ export class Tui {
     const body = Math.max(0, H - 5);
     const out = [prompt, T.fg('border', line)];
     if (!rows.length && body > 0) out.push(T.fg('muted', clipTo(`(no sessions match "${q}")`, W)));
-    for (let i = 0; i < Math.min(rows.length, body); i++) out.push(this.formatRow(rows[i], i + 1, W, false));
+    for (let i = 0; i < Math.min(rows.length, body); i++) {
+      out.push(this.storeMode
+        ? this.formatStoreRow(rows[i], i + 1, W, false)
+        : this.formatRow(rows[i], i + 1, W, false));
+    }
     while (out.length < Math.max(2, H - 2)) out.push('');
     out.length = Math.max(2, H - 2);
     out.push(T.fg('border', line));
@@ -820,8 +1286,13 @@ export class Tui {
   renderMenu(W, line) {
     const s = this.selected;
     const T = this.theme;
-    const x = s ? this.discovery.getSession(s.session_id) : null;
+    const x = s ? (this.storeMode ? storeRowToDbShape(s) : this.discovery.getSession(s.session_id)) : null;
     if (!x) return [T.fg('muted', clipTo('(session gone — press q)', W))];
+    if (s && this.storeMode) {
+      // a file-store row is authoritative enough for the header; the DB row
+      // (when present) supplies status/kind
+      x.title = s._name?.name ?? x.title;
+    }
     const H = this.height;
     const hasMsg = !!this.message;
     // bottom chrome is fixed: rule + hint (+ optional message)
@@ -1018,6 +1489,136 @@ export class Tui {
     return rows;
   }
 
+  // -------------------------------------------------- detail / events render
+  renderDetail(W, line) {
+    const T = this.theme;
+    const H = this.height;
+    const L = this.outputText.split('\n');
+    const keys = 'enter events   t tools   v integrity   r raw   m markdown   e export   esc back';
+    // chrome: title + rule + body + rule + keys = 5
+    const max = Math.max(1, H - 5);
+    const start = Math.min(Math.max(0, this._outputScroll), Math.max(0, L.length - max));
+    const shown = L.slice(start, start + max);
+    return [
+      clipTo(' ' + T.style({ bold: true, fg: 'brand' }, this.outputTitle) + (this._evLoading ? T.fg('dim', '  (parsing…)') : ''), W),
+      T.fg('border', line),
+      ...shown.map(l => clipTo(l, W)),
+      ...Array.from({ length: Math.max(0, max - shown.length) }, () => ''),
+      T.fg('border', line),
+      clipTo(T.fg('dim', keys), W),
+    ].slice(0, H);
+  }
+
+  // chronological event stream: one record per line, ORIGINAL stored order.
+  // Only the visible window's text is materialised, so a session with
+  // thousands of records never builds thousands of strings.
+  renderEvents(W, line) {
+    const T = this.theme;
+    const g = this.glyphs;
+    const H = this.height;
+    const evs = this.visibleEvents;
+    const ps = this.eventPageSize;
+    const start = Math.min(this.evOffset, Math.max(0, evs.length - ps));
+    const shown = evs.slice(start, start + ps);
+    const title = ' events'
+      + (this.evFilter === 'tools' ? ' (tool only)' : '')
+      + (this.evMatches ? `  match ${this.evMatchCursor + 1}/${this.evMatches.length}` : '')
+      + (this.evSearchBuf ? `  /${this.evSearchBuf}` : '');
+    const rows = [
+      clipTo(' ' + T.style({ bold: true, fg: 'brand' }, title)
+        + '  ' + T.fg('muted', `${evs.length} shown / ${this.parsed?.stats.records ?? 0} records`), W),
+      T.fg('border', line),
+    ];
+    for (let i = 0; i < shown.length; i++) {
+      const ev = shown[i];
+      const sel = i === this.evCursor;
+      const isMatch = this.evMatches?.includes(ev.index);
+      rows.push(this.formatEventRow(ev, W, sel, isMatch));
+    }
+    while (rows.length < 2 + ps) rows.push('');
+    rows.length = 2 + Math.min(ps, shown.length) + (rows.length > 2 + ps ? 0 : 0);
+    rows.length = Math.min(rows.length, H - 3);
+    while (rows.length < H - 3) rows.push('');
+    rows.push(T.fg('border', line));
+    rows.push(clipTo(T.fg('dim', W < 64
+      ? ' j/k enter t tools / search n next  esc'
+      : ' j/k move  enter record  t tool-only  / search  n/N next/prev  r raw  v integrity  e export  esc back'), W));
+    return rows.slice(0, H);
+  }
+
+  // one event: role-coloured label + a compact preview of what it carries
+  formatEventRow(ev, W, sel, isMatch) {
+    const T = this.theme;
+    const g = this.glyphs;
+    const num = String(ev.index).padStart(3);
+    const role = ev.role ?? 'unknown';
+    const roleColor = role === 'user' ? 'signal'
+      : role === 'assistant' ? 'brand'
+        : role === 'toolResult' ? (ev.isError ? 'error' : 'success')
+          : role === 'compactionSummary' ? 'orbit'
+            : 'muted';
+    const label = role === 'toolResult' ? `TOOL RESULT ${ev.toolName ?? '?'}`
+      : role === 'assistant' ? 'ASSISTANT'
+        : role === 'user' ? 'USER'
+          : String(role).toUpperCase();
+    let preview = '';
+    if (role === 'toolResult') {
+      preview = `id:${(ev.toolCallId ?? '?').slice(0, 18)}  status:${ev.status ?? '?'}  exit:${ev.exitCode ?? '?'}`;
+    } else {
+      const calls = (ev.blocks || []).filter(b => b.kind === 'toolCall');
+      const thinks = (ev.blocks || []).filter(b => b.kind === 'thinking').length;
+      const parts = [];
+      if (ev.text) parts.push(String(ev.text).replace(/\s+/g, ' ').trim());
+      if (thinks) parts.push(`(${thinks} thinking)`);
+      if (calls.length) parts.push(`→ ${calls.map(c => c.toolName).join(', ')}`);
+      preview = parts.join('  ');
+    }
+    const left = `${sel ? g.arrow : ' '}${num}  ${label}`;
+    const budget = Math.max(4, W - dispWidth(left) - 3);
+    const plain = left + '  ' + clipTo(preview, budget);
+    if (sel) return T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(clipTo(plain, W), W));
+    if (isMatch) return T.style({ bg: 'selectedBg' }, clipTo(padTo(plain, W), W));
+    return clipTo(
+      T.fg('dim', `${sel ? g.arrow : ' '}${num}`) + '  '
+      + T.fg(roleColor, label) + '  '
+      + T.fg(role === 'toolResult' ? 'text' : 'muted', clipTo(preview, budget)),
+      W,
+    );
+  }
+
+  renderExportMenu(W, line) {
+    const T = this.theme;
+    const H = this.height;
+    const e = this.entry;
+    const nm = e?._name?.name ?? e?.sessionId ?? 'session';
+    const out = [
+      clipTo(' ' + T.style({ bold: true, fg: 'brand' }, ' export (written inside the workspace)'), W),
+      clipTo(` ${T.fg('muted', 'session')} ${T.fg('text', trunc(nm, Math.max(4, W - 12)))}`, W),
+      clipTo(` ${T.fg('muted', 'dir')} ${T.fg('dim', trunc(EXPORT_DIR, Math.max(4, W - 8)))}`, W),
+      T.fg('border', line),
+    ];
+    const max = Math.max(1, H - out.length - 2);
+    const n = this.foptions.length;
+    let start = 0;
+    if (n > max) start = Math.max(0, Math.min(n - max, this.fcursor - (max >> 1)));
+    const end = Math.min(n, start + max);
+    const body = [];
+    if (start > 0) body.push(T.fg('dim', clipTo(`  ↑ +${start}`, W)));
+    for (let i = start; i < end; i++) {
+      const o = this.foptions[i];
+      const hl = i === this.fcursor;
+      const plain = `${hl ? this.glyphs.arrow : ' '}${String(i + 1).padStart(2)}  ${o.label}`;
+      if (hl) body.push(T.style({ bg: 'selectedBg', fg: 'signal', bold: true }, padTo(clipTo(plain, W), W)));
+      else body.push(clipTo(` ${T.fg('dim', String(i + 1))}  ${T.fg('text', o.label)}`, W));
+    }
+    if (end < n) body.push(T.fg('dim', clipTo(`  ↓ +${n - end}`, W)));
+    while (body.length < max) body.push('');
+    out.push(...body.slice(0, max), T.fg('border', line));
+    out.push(clipTo(T.fg('dim', W < 44 ? ' j/k  enter  esc' : ' j/k choose   enter exports   esc back'), W));
+    return out.slice(0, H);
+  }
+// ----------------------------------------------------------------- utils
+// truncate to a *display width* (titles may contain wide characters)
   // -------------------------------------------------------------- utils
   // message kinds map onto mcode's semantic colours
   colored(text, kind) {
@@ -1026,8 +1627,6 @@ export class Tui {
   }
 }
 
-// ----------------------------------------------------------------- utils
-// truncate to a *display width* (titles may contain wide characters)
 function truncW(s, n) {
   s = String(s ?? '');
   if (dispWidth(s) <= n) return s;
@@ -1081,4 +1680,45 @@ function arrowName(spec, fin) {
   if (fin === 'F' || fin === '4') return 'end';
   if (fin === '~') return spec === '5' ? 'pgup' : spec === '6' ? 'pgdn' : 'escape';
   return 'escape';
+}
+
+
+// ---- module-level helpers (kept out of the class so the state machine stays
+// readable; all pure) -------------------------------------------------------
+function fmtBytesTui(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return `${b}B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)}K`;
+  return `${(b / 1024 / 1024).toFixed(1)}M`;
+}
+function fmtCountsTui(o) {
+  return Object.entries(o).map(([k, v]) => `${k}=${v}`).join('  ');
+}
+function fmtLabel(fmt) {
+  const labels = {
+    raw: 'raw jsonl (byte-for-byte)',
+    json: 'detailed json (all records)',
+    markdown: 'detailed markdown',
+    archive: 'full session dir (.tar.gz)',
+    bundle: 'bundle (raw+json+md+info+integrity)',
+    info: 'session_info.json only',
+    integrity: 'integrity.txt only',
+  };
+  return labels[fmt] ?? fmt;
+}
+// adapt a file-store entry to the shape renderMenu/formatRow expect so the
+// existing action menu keeps working unchanged for SQLite-backed sessions
+function storeRowToDbShape(e) {
+  return {
+    session_id: e.sessionId,
+    title: e.storedTitle ?? e._name?.name ?? null,
+    status: e.status ?? null,
+    archived: e.archived ? 1 : 0,
+    session_kind: e.sessionKind ?? null,
+    workspace_dir: e.workspaceDir ?? null,
+    parent_session_id: e.parentId ?? null,
+    created_at_ms: e.createdAtMs ?? null,
+    updated_at_ms: e.updatedAtMs ?? null,
+    __fileStore: true,
+  };
 }

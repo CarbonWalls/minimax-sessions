@@ -8,20 +8,27 @@ import { Lifecycle } from './lifecycle.js';
 import { Inspector, EXPORT_FORMATS } from './inspect.js';
 import { Safety } from './safety.js';
 import { Repairer } from './repair.js';
+import { StoreIndex } from './store.js';
+import { parseSession, integrityReport } from './jsonl.js';
+import {
+  exportSession, EXPORT_FORMATS as STORE_FORMATS, renderIntegrity, EXPORTER_VERSION,
+} from './exportx.js';
 import { trunc, shortWs, relAge, iso, wrapText, clipTo, fitLR, dispWidth } from './format.js';
+import { sessionInfo } from './exportx.js';
+import { preload } from './store.js';
 import {
   DB_PATH, MSM_DIR, MSM_LOG_DIR, MSM_BACKUP_DIR, dbExists, mcodeBinExists,
   mcodeVersion, MCODE_BIN, MCODE_INSTALL_ROOT, MCODE_PKG,
   SESSION_ID_PREFIX, parseFlags,
 } from './env.js';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 const HELP = `mcode-sessions — MiniMax Code session manager
 
 usage:
   mcode-sessions                       interactive TUI (default, no args)
-  mcode-sessions list [text]           list sessions
+  mcode-sessions list [text]           list sessions (runtime database)
   mcode-sessions search <text>         search title/purpose/id
                                        (--messages also hits bodies)
   mcode-sessions inspect <id>          show compact metadata
@@ -40,6 +47,20 @@ usage:
   mcode-sessions resume <id>           launch mcode attached to a session
   mcode-sessions doctor                env / schema / native runtime check
 
+  deep file-store inspector (mcode 0.5.5 sessions on disk):
+  mcode-sessions store                 TUI over the on-disk session store
+  mcode-sessions store list [text]     list on-disk sessions + derived names
+  mcode-sessions store search <text>   search names / ids / cwds / models
+  mcode-sessions store inspect <ref>   deep metadata + record counts
+  mcode-sessions store verify <ref>    integrity / pairing report
+  mcode-sessions store export <ref>    --format raw|json|markdown|archive|
+                                       bundle|info|integrity
+  mcode-sessions store show <ref>      --record N   one record; --raw for
+                                       verbatim JSON, --tools for tool-only
+
+  <ref> is any of: mvs_ id | session directory name | session dir path |
+  messages.jsonl path
+
 filters:
   --archived / --no-archived / --only-archived
   --status <s>   --kind <k>   --workspace <dir>   --parent <id>
@@ -53,14 +74,21 @@ safety:
 output / logging:
   --json                 machine-readable output
   --limit <n> / --offset <n>   page list results (default limit 200)
-  --out <file>           write export output to a file
-  --format <fmt>         export format: ${EXPORT_FORMATS.join(' | ')}
+  --out <file|dir>       write export output there (default <checkout>/exports)
+  --format <fmt>         export format (see above)
+  --record <n>           show only this record number (store show)
+  --max-records <n>      cap a markdown export (default: every record)
+  --redact               best-effort redaction of obvious secrets
+  --tools                tool-only view (store show / TUI)
   --ascii                plain-ASCII UI (no box-drawing)
   --no-color             disable colour
   --debug / --verbose    more detail in the msm.log file
 
 env overrides:
   MSM_RUNTIME_DATA_DIR   MiniMax runtime data dir
+  MSM_SESSIONS_DIR       on-disk session store (default <runtime>/v2/sessions)
+  MSM_EXPORT_DIR         where exports are written (default <checkout>/exports)
+  MSM_WORKSPACE          this tool's checkout (all writes stay inside it)
   MSM_HOME               this tool's state dir
   MSM_MCODE_ROOT         mcode install root
   MSM_MCODE_RELEASE      pin a release (else newest is auto-found)
@@ -89,6 +117,10 @@ export async function runCli(argv) {
 
   // doctor works even when the DB is missing (it reports that as a finding)
   if (cmd === 'doctor') return cmdDoctor(flags, log);
+
+  // The file-store inspector works from the on-disk session tree alone; the
+  // SQLite DB only enriches rows (title/status/parent) when it is available.
+  if (cmd === 'store') return cmdStore(positional.slice(1), flags, log);
 
   if (!dbExists()) {
     stderr(`runtime database not found: ${DB_PATH}`);
@@ -592,4 +624,323 @@ function formatRow(r, n, width = 80) {
   const fixed = 2 + dispWidth(num) + 2 + dispWidth(kind) + dispWidth(ws) + 2 + dispWidth(right);
   const title = clipTo(r.title ?? '(untitled)', Math.max(4, width - fixed));
   return clipTo(fitLR(`${num}  ${title}${kind}${ws}`, right, width), width);
+}
+
+// ------------------------------------------------------- store (file store)
+// Deep inspector/exporter for the mcode 0.5.5 on-disk session tree. Reads
+// only; every export lands inside the workspace's exports/ directory.
+
+async function openStore(flags, log, { enrich = true } = {}) {
+  const db = enrich && dbExists() ? new SqliteAdapter({ log }) : null;
+  const store = new StoreIndex({ log, db });
+  if (!store.available()) {
+    throw new Error(`session store not found: ${store.dir} (set MSM_SESSIONS_DIR to override)`);
+  }
+  store.entries();
+  if (db) store.enrich();
+  return { store, db };
+}
+
+async function cmdStore(args, flags, log) {
+  const sub = args[0] ?? '';
+  if (!sub) {
+    const { runTui } = await import('./tui.js');
+    return runTui({ flags, log, storeMode: true });
+  }
+  switch (sub) {
+    case 'list':    return cmdStoreList(args.slice(1), flags, log);
+    case 'search':  return cmdStoreList(args.slice(1), flags, log, true);
+    case 'inspect': return await cmdStoreInspect(args.slice(1), flags, log);
+    case 'verify':  return await cmdStoreVerify(args.slice(1), flags, log);
+    case 'export':  return await cmdStoreExport(args.slice(1), flags, log);
+    case 'show':    return await cmdStoreShow(args.slice(1), flags, log);
+    default:
+      stderr(`unknown store command: ${sub}\n\n${wrapText(HELP, termWidth())}`);
+      return 2;
+  }
+}
+
+async function resolveStoreRef(args, flags, log) {
+  const { store, db } = await openStore(flags, log);
+  const ref = String(flags.session ?? args[0] ?? '').trim();
+  if (!ref) throw new Error('no session given (use an mvs_ id, a session directory name, or a path)');
+  const entry = store.resolve(ref);
+  if (!entry) { try { db?.close(); } catch {} throw new Error(`session not found in the file store: ${ref}`); }
+  return { store, db, entry };
+}
+
+// list/search share one path: filter the in-memory index, then resolve names
+// for the page actually displayed (a list never parses messages.jsonl)
+async function cmdStoreList(args, flags, log, isSearch = false) {
+  const { store, db } = await openStore(flags, log);
+  const q = isSearch ? String(args[0] ?? '').toLowerCase() : (args[0] ? String(args[0]).toLowerCase() : null);
+  const limit = listLimit(flags, 200);
+  const offset = Number.isFinite(flags.offset) && flags.offset > 0 ? flags.offset : 0;
+  let entries = store.entries();
+  if (flags.onlyArchived) entries = entries.filter(e => e.archived);
+  else if (flags.includeArchived === false) entries = entries.filter(e => !e.archived);
+  if (flags.status) entries = entries.filter(e => e.status === flags.status);
+  if (flags.kind) entries = entries.filter(e => e.sessionKind === flags.kind);
+  if (flags.parent) entries = entries.filter(e => e.parentId === flags.parent);
+  if (flags.workspace) entries = entries.filter(e => e.workspaceDir === flags.workspace);
+  const total = entries.length;
+  const page = entries.slice(offset, offset + limit);
+
+  // names are resolved concurrently and only for this page
+  await preload(page, async e => { await e.nameInfo(); });
+  if (q) {
+    // second pass on the resolved names for a search
+    const all = total > page.length ? entries : page;
+    await preload(all.slice(0, Math.min(400, all.length)), async e => { await e.nameInfo(); });
+  }
+  const rows = page.map(e => rowForStore(e, store));
+  const filtered = q ? rows.filter(r => matchStoreRow(r, q)) : rows;
+  const ftotal = q ? filtered.length : total;
+
+  if (flags.json) {
+    process.stdout.write(JSON.stringify({
+      query: isSearch ? (args[0] ?? null) : null,
+      total: ftotal, limit, offset,
+      sessions: (q ? filtered : rows).map(storeRowJson),
+    }, null, 2) + '\n');
+    try { db?.close(); } catch {}
+    return 0;
+  }
+  const fac = store.facetCounts();
+  print(`mcode sessions (file store ${store.dir})`, flags);
+  print(`total=${ftotal}${q ? ` matching "${args[0]}"` : ''}  store=${fac.total}  indexed=${fac.inDatabase}  archived=${fac.archived}  (mcode ${mcodeVersion()})`, flags);
+  print('-'.repeat(Math.min(cols(), 70)), flags);
+  if (!rows.length) { print('(no sessions match)', flags); try { db?.close(); } catch {} return 0; }
+  for (let i = 0; i < (q ? filtered : rows).length; i++) {
+    const r = q ? filtered[i] : rows[i];
+    print(formatStoreRow(r, offset + i + 1, cols()), flags);
+  }
+  if (offset + rows.length < total) print(`… ${total - offset - rows.length} more (use --limit/--offset)`, flags);
+  try { db?.close(); } catch {}
+  return 0;
+}
+
+function rowForStore(e) {
+  const nm = e._name;
+  return {
+    sessionId: e.sessionId,
+    name: nm?.name ?? null,
+    nameSource: nm?.source ?? null,
+    stored: !!e.db,
+    title: e.storedTitle ?? null,
+    status: e.status,
+    archived: e.archived,
+    kind: e.sessionKind,
+    workspace: e.workspaceDir,
+    parentId: e.parentId,
+    isBranch: e.isBranch,
+    createdAtMs: e.createdAtMs,
+    updatedAtMs: e.updatedAtMs,
+    messagesSize: e.messagesSize,
+    hasMessages: e.hasMessages,
+    recordCount: e.catalogCount,
+    dirName: e.dirName,
+    dir: e.dir,
+  };
+}
+function storeRowJson(r) { return r; }
+function matchStoreRow(r, q) {
+  return [r.name, r.sessionId, r.workspace, r.title, r.dirName].some(v => v && String(v).toLowerCase().includes(q));
+}
+
+// One row for the file-store list. Narrow terminals degrade to name+size.
+function formatStoreRow(r, n, width = 80) {
+  const num = String(n).padStart(width < 46 ? 2 : 3);
+  const name = r.name ?? '(untitled)';
+  const rec = r.recordCount != null ? `${r.recordCount}rec` : (r.hasMessages ? '?' : 'empty');
+  const size = bytesFmt(r.messagesSize);
+  const kind = r.kind && r.kind !== 'conversation' ? ` <${r.kind[0]}>` : '';
+  const branch = r.isBranch ? ' br' : '';
+  const ws = (!r.workspace || r.workspace === '/root') ? '' : ` @${shortWs(r.workspace)}`;
+  if (width < 46) {
+    const right = `${rec} ${size}`.trim();
+    const budget = Math.max(6, width - 1 - dispWidth(num) - 1 - dispWidth(right));
+    return clipTo(`${num} ${clipTo(name, budget)} ${right}`, width);
+  }
+  const right = `${rec.padStart(5)} ${size.padStart(8)}`;
+  const fixed = 1 + dispWidth(num) + 2 + dispWidth(kind) + dispWidth(branch) + dispWidth(ws) + 2 + dispWidth(right);
+  const title = clipTo(name, Math.max(4, Math.min(46, width - fixed)));
+  return clipTo(fitLR(`${num}  ${title}${kind}${branch}${ws}`, right, width), width);
+}
+function bytesFmt(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return `${b}B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)}K`;
+  return `${(b / 1024 / 1024).toFixed(1)}M`;
+}
+
+async function cmdStoreInspect(args, flags, log) {
+  const { store, db, entry } = await resolveStoreRef(args, flags, log);
+  await entry.populate();
+  const nm = await entry.nameInfo();
+  const parsed = entry.hasMessages ? await parseSession(entry.messagesPath) : null;
+  const info = parsed ? sessionInfoOf(entry, parsed, nm) : null;
+  if (flags.json) {
+    process.stdout.write(JSON.stringify({ ...rowForStore(entry), nameSource: nm.source, firstLineTruncated: nm.firstLineTruncated, info }, null, 2) + '\n');
+    try { db?.close(); } catch {}
+    return 0;
+  }
+  print(`session: ${nm.name}`);
+  print(`name source: ${nm.source}${nm.firstLineTruncated ? '  (first line too long; truncated)' : ''}`);
+  print(`session id: ${entry.sessionId}`);
+  print(`source: ${entry.messagesPath ?? '(no messages.jsonl)'}`);
+  print(`mcode version: ${mcodeVersion()}   layout: ${entry.mcodeLayout ?? 'unknown'}`);
+  print(`created: ${iso(entry.createdAtMs)}   modified: ${iso(entry.updatedAtMs)}`);
+  print(`file size: ${bytesFmt(entry.messagesSize)}${entry.messagesSize ? `  (${entry.messagesSize} bytes)` : ''}`);
+  if (entry.status || entry.archived) print(`status: ${entry.status ?? '?'}${entry.archived ? ' (archived)' : ''}`);
+  if (entry.sessionKind) print(`kind: ${entry.sessionKind}`);
+  if (entry.workspace) print(`cwd: ${entry.workspace}`);
+  if (entry.parentId) print(`parent: ${entry.parentId}${entry.isBranch ? '  (branch/subagent)' : ''}`);
+  print(`in runtime index: ${entry.db ? 'yes' : 'no (file-store only)'}`);
+  print(`sidecars: ${entry.sidecars.join(', ') || 'none'}`);
+  if (info) {
+    print(`records: ${info.recordCount}   turns: ${info.counts.turns}`);
+    print(`roles: ${fmtCounts(info.counts.roles)}`);
+    print(`blocks: ${fmtCounts(info.counts.blockTypes)}`);
+    print(`tools: ${fmtCounts(info.counts.tools)}`);
+    print(`tool calls: ${info.counts.toolCalls}   results: ${info.counts.toolResults}   matched: ${info.counts.matched}   missing: ${info.counts.missingResults}   orphan: ${info.counts.orphanResults}`);
+    print(`model: ${info.model ?? '(none)'}   provider: ${info.provider ?? '(none)'}`);
+  }
+  try { db?.close(); } catch {}
+  return 0;
+}
+function fmtCounts(o) {
+  return Object.entries(o).map(([k, v]) => `${k}=${v}`).join('  ');
+}
+function sessionInfoOf(entry, parsed, nm) {
+  return sessionInfo(entry, parsed, { nameInfo: nm });
+}
+
+async function cmdStoreVerify(args, flags, log) {
+  const { db, entry } = await resolveStoreRef(args, flags, log);
+  if (!entry.hasMessages) { stderr('session has no messages.jsonl to verify'); try { db?.close(); } catch {} return 2; }
+  const parsed = await parseSession(entry.messagesPath);
+  const nm = await entry.nameInfo();
+  const info = sessionInfoOf(entry, parsed, nm);
+  const integ = integrityReport(parsed, { name: nm.name, nameSource: nm.source });
+  if (flags.json) {
+    process.stdout.write(JSON.stringify({ integrity: integ, pairing: parsed.pairing }, null, 2) + '\n');
+    try { db?.close(); } catch {}
+    return integ.ok ? 0 : 1;
+  }
+  process.stdout.write(renderIntegrity(integ, info, parsed));
+  try { db?.close(); } catch {}
+  return integ.ok ? 0 : 1;
+}
+
+async function cmdStoreExport(args, flags, log) {
+  const { db, entry } = await resolveStoreRef(args, flags, log);
+  const format = flags.format ?? 'bundle';
+  if (!STORE_FORMATS.includes(format)) {
+    stderr(`unknown format: ${format} (use ${STORE_FORMATS.join(' | ')})`);
+    try { db?.close(); } catch {}
+    return 2;
+  }
+  const r = await exportSession(entry, {
+    format,
+    out: flags.out || null,
+    redact: !!flags.redact,
+    maxRecords: Number.isFinite(flags.maxRecords) && flags.maxRecords > 0 ? flags.maxRecords : null,
+    log,
+  });
+  if (flags.json) { process.stdout.write(JSON.stringify(r, null, 2) + '\n'); try { db?.close(); } catch {} return 0; }
+  print(`exported: ${entry.sessionId}`);
+  print(`name: ${r.name}`);
+  for (const f of r.files) print(`  ${f}`);
+  print(`format: ${format}${r.redacted ? '  (REDACTED — best effort, not guaranteed complete)' : ''}`);
+  if (r.rawSha256) print(`raw sha256: source=${r.rawSha256.source}  export=${r.rawSha256.export}  byte-identical=${r.rawSha256.byteIdentical ? 'YES' : 'NO'}`);
+  for (const w of r.warnings) stderr(w);
+  try { db?.close(); } catch {}
+  return 0;
+}
+
+async function cmdStoreShow(args, flags, log) {
+  const { db, entry } = await resolveStoreRef(args, flags, log);
+  if (!entry.hasMessages) { stderr('session has no messages.jsonl'); try { db?.close(); } catch {} return 2; }
+  const parsed = await parseSession(entry.messagesPath);
+  const want = Number(flags.record);
+  if (Number.isFinite(want) && want > 0) {
+    const rec = parsed.records.find(r => r.index === want);
+    if (!rec) { stderr(`no record #${want} (session has ${parsed.stats.records})`); try { db?.close(); } catch {} return 2; }
+    if (flags.json || !flags.raw) {
+      process.stdout.write(JSON.stringify(rec.obj ?? { parseError: rec.error, raw: rec.raw }, null, 2) + '\n');
+    } else {
+      process.stdout.write(rec.raw + '\n');
+    }
+    try { db?.close(); } catch {}
+    return rec.error ? 1 : 0;
+  }
+  if (flags.json) {
+    process.stdout.write(JSON.stringify(parsed.events, null, 2) + '\n');
+    try { db?.close(); } catch {}
+    return 0;
+  }
+  const nm = await entry.nameInfo();
+  const info = sessionInfoOf(entry, parsed, nm);
+  const integ = integrityReport(parsed, { name: nm.name, nameSource: nm.source });
+  const body = flags.raw
+    ? parsed.records.map(r => r.raw).join('\n') + '\n'
+    : buildMarkdownForShow(parsed, info, integ, { tools: flags.tools });
+  process.stdout.write(body);
+  try { db?.close(); } catch {}
+  return 0;
+}
+
+// Chronological event stream for the terminal: one compact block per record.
+// --tools collapses it to tool calls + their results only.
+function buildMarkdownForShow(parsed, info, integ, { tools = false } = {}) {
+  const L = [];
+  L.push(`# ${info.name}`, `# source: ${info.sourcePath}`, `# records: ${info.recordCount}  tools: ${integ.toolCalls}/${integ.toolResults}  matched: ${integ.matchedCallsResults}`, '');
+  for (const ev of parsed.events) {
+    if (tools && ev.role !== 'toolResult' && !(ev.blocks || []).some(b => b.kind === 'toolCall')) continue;
+    L.push(`[record ${ev.index}] ${labelFor(ev)}`);
+    if (ev.messageId) L.push(`message_id: ${ev.messageId}`);
+    if (ev.turnId) L.push(`turn_id: ${ev.turnId}`);
+    const rec = parsed.records[ev.index - 1];
+    const msg = rec?.obj?.message;
+    if (Array.isArray(msg?.content)) {
+      for (const b of msg.content) {
+        if (b.type === 'text' && !tools) { L.push('text:', indent(b.text), ''); continue; }
+        if (b.type === 'thinking' && !tools) { L.push('thinking:', indent(b.thinking), ''); continue; }
+        if (b.type === 'toolCall') {
+          L.push(`TOOL CALL  name: ${b.name}  id: ${b.id}`);
+          L.push('arguments:', indent(JSON.stringify(b.arguments ?? {}, null, 2)), '');
+        }
+      }
+    } else if (typeof msg?.content === 'string' && !tools) {
+      L.push('text:', indent(msg.content), '');
+    }
+    if (ev.role === 'toolResult') {
+      L.push(`RESULT  status: ${ev.status ?? '(unknown)'}  exitCode: ${ev.exitCode ?? '?'}`);
+      const po = msg?.details?.processOutput;
+      if (po) {
+        L.push('stdout:', indent(po.stdout ?? ''), '');
+        if (po.stderr) L.push('stderr:', indent(po.stderr), '');
+      } else if (msg?.content) {
+        L.push('content:', indent(stringifyContentPlain(msg.content)), '');
+      }
+      if (msg?.details) { L.push('details:', indent(JSON.stringify(msg.details, null, 2)), ''); }
+    }
+    L.push('---', '');
+  }
+  return L.join('\n');
+}
+function labelFor(ev) {
+  if (ev.role === 'toolResult') return `TOOL RESULT  ${ev.toolName ?? '?'}`;
+  if (ev.role === 'user') return 'USER';
+  if (ev.role === 'assistant') return 'ASSISTANT';
+  return String(ev.role ?? 'unknown').toUpperCase();
+}
+function indent(s, pad = '  ') {
+  return String(s ?? '').split('\n').map(l => pad + l).join('\n');
+}
+function stringifyContentPlain(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(b => b?.text ?? JSON.stringify(b)).join('\n');
+  return JSON.stringify(content, null, 2);
 }

@@ -2,6 +2,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const MCODE_INSTALL_ROOT = process.env.MSM_MCODE_ROOT || '/root/.minimax-code';
 
@@ -50,11 +51,28 @@ export const MCODE_BIN = path.join(MCODE_INSTALL_ROOT, 'bin', 'mcode');
 export const RUNTIME_DATA_DIR = process.env.MSM_RUNTIME_DATA_DIR || '/root/.minimax';
 export const DB_PATH = path.join(RUNTIME_DATA_DIR, 'v2', 'sqlite', 'runtime-state.sqlite');
 
+// mcode 0.5.5 persists every session as a directory tree under v2/sessions:
+//   <root>/YYYY/MM/DD/HH-MM-SS-mmm-session_<base64(sessionId)>/
+//      manifest.json  history-catalog.json  messages.jsonl
+//      user-message-locators.jsonl  llm-call.json  snapshots/  reports/
+// The directory name's suffix is the base64 of the mvs_ session id, but the
+// manifest is authoritative for it (it never depends on our own decoding).
+export const SESSIONS_DIR = process.env.MSM_SESSIONS_DIR || path.join(RUNTIME_DATA_DIR, 'v2', 'sessions');
+
 // Our own state lives OUTSIDE the MiniMax database.
 export const MSM_DIR = process.env.MSM_HOME || path.join(homedir(), '.mcode-session-manager');
 export const MSM_LOG_DIR = path.join(MSM_DIR, 'logs');
 export const MSM_BACKUP_DIR = path.join(MSM_DIR, 'backups');
 export const MSM_BACKUP_KEEP = envInt('MSM_BACKUP_KEEP', 5);
+
+// Everything this tool WRITES stays inside its own checkout: derived indexes,
+// caches, and every export. Nothing is ever written into ~/.minimax. The
+// checkout root is derived from this module's own location so the tool works
+// when invoked from any cwd; MSM_WORKSPACE overrides it (tests use that).
+const CHECKOUT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const WORKSPACE_DIR = process.env.MSM_WORKSPACE || CHECKOUT_ROOT;
+export const EXPORT_DIR = process.env.MSM_EXPORT_DIR || path.join(WORKSPACE_DIR, 'exports');
+export const CACHE_DIR = process.env.MSM_CACHE_DIR || path.join(WORKSPACE_DIR, '.cache');
 
 export const SESSION_ID_PREFIX = 'mvs_';
 
@@ -78,6 +96,7 @@ export function parseFlags(argv) {
     format: null, status: null, kind: null, workspace: null,
     cwd: null, limit: null, offset: null, out: null, parent: null,
     messages: false,
+    record: null, maxRecords: null, redact: false, tools: false, raw: false,
     unknown: [],
   };
   const positional = [];
@@ -109,6 +128,9 @@ export function parseFlags(argv) {
     if (a === '--ascii') { f.ascii = true; continue; }
     if (a === '--json') { f.json = true; continue; }
     if (a === '--messages' || a === '-m') { f.messages = true; continue; }
+    if (a === '--redact') { f.redact = true; continue; }
+    if (a === '--tools' || a === '--tool-only') { f.tools = true; continue; }
+    if (a === '--raw') { f.raw = true; continue; }
     if (a === '--archived' || a === '--include-archived') { f.includeArchived = true; f.onlyArchived = false; continue; }
     if (a === '--no-archived' || a === '--exclude-archived') { f.includeArchived = false; f.onlyArchived = false; continue; }
     if (a === '--only-archived') { f.onlyArchived = true; f.includeArchived = true; continue; }
@@ -124,6 +146,8 @@ export function parseFlags(argv) {
     if ((m = valueOf(i, a, '--parent', '-p')) !== null) { f.parent = String(m.value ?? ''); i = m.i; continue; }
     if ((m = valueOf(i, a, '--limit', '-n')) !== null) { f.limit = intOf(m.value); i = m.i; continue; }
     if ((m = valueOf(i, a, '--offset', null)) !== null) { f.offset = intOf(m.value); i = m.i; continue; }
+    if ((m = valueOf(i, a, '--record', null)) !== null) { f.record = intOf(m.value); i = m.i; continue; }
+    if ((m = valueOf(i, a, '--max-records', null)) !== null) { f.maxRecords = intOf(m.value); i = m.i; continue; }
 
     if (a.startsWith('-') && a !== '-') { f.unknown.push(a); continue; }
     positional.push(a);

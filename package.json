@@ -1,6 +1,6 @@
 {
   "name": "mcode-session-manager",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Standalone local session manager for MiniMax Code (inspect, browse, rename, archive, fork, delete, export, stats).",
   "type": "module",
   "bin": {
@@ -17,8 +17,9 @@
   },
   "scripts": {
     "start": "node ./bin/mcode-sessions",
-    "test": "npm run test:unit && npm run test:tui && npm run test:mutations",
+    "test": "npm run test:unit && npm run test:jsonl && npm run test:tui && npm run test:mutations",
     "test:unit": "node tests/unit.test.mjs",
+    "test:jsonl": "node tests/jsonl.test.mjs",
     "test:tui": "node tests/tui.test.mjs",
     "test:mutations": "node tests/mutations.test.mjs",
     "doctor": "node ./bin/mcode-sessions doctor"
