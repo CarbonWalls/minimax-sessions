@@ -204,6 +204,7 @@ tree directly — so they keep working after the runtime has dropped old
 sessions from its index. When the SQLite database *is* present, its title /
 status / kind / workspace / parent columns enrich the same rows.
 
+```
 filters: --archived/--no-archived/--only-archived  --status <s>  --kind <k>
          --workspace <dir>  --parent <id>
 safety:  --dry-run  --confirm  --no-backup  --session <id>
